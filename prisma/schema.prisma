@@ -2,40 +2,33 @@ generator client {
   provider = "prisma-client-js"
 }
 
-
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-
 model UserData {
-  id BigInt @id @default(autoincrement())
-  session_key String @db.Uuid
-
-  latitude Decimal? @db.Decimal(10, 7)
-  longitude Decimal? @db.Decimal(10, 7)
-  location Unsupported("geography(Point,4326)")?
-  datetime DateTime?
-
-  fingerprintSha String? @db.Char(16)
+  id               BigInt                    @id @default(autoincrement())
+  session_key      String                    @db.Uuid
+  latitude         Decimal?                  @db.Decimal(10, 7)
+  longitude        Decimal?                  @db.Decimal(10, 7)
+  location         Unsupported("geography")?
+  datetime         DateTime?
+  fingerprintSha   String?                   @db.Char(16)
   browser_language String?
-  page_language String?
-  timezone String?
-  email String?
-
-  ward String?
-  mandal String?
-  district String?
-  pincode String?
-  state String?
-
-  device_type String?
-  source String?
-  probability Decimal? @db.Decimal(5, 4)
-
-  created_at DateTime @default(now())
-  updated_at DateTime @default(now()) @updatedAt
+  page_language    String?
+  timezone         String?
+  email            String?
+  ward             String?
+  mandal           String?
+  district         String?
+  pincode          String?
+  state            String?
+  device_type      String?
+  source           String?
+  probability      Decimal?                  @db.Decimal(5, 4)
+  created_at       DateTime                  @default(now())
+  updated_at       DateTime                  @default(now()) @updatedAt
 
   @@index([session_key])
   @@index([fingerprintSha])
@@ -44,37 +37,31 @@ model UserData {
   @@index([district])
   @@index([pincode])
   @@index([updated_at])
-  @@index([location], type: Gist, map: "idx_user_data_location")
+  @@index([location], map: "idx_user_data_location", type: Gist)
 }
 
 model CuratedData {
-  session_key String @id @db.Uuid
-
-  latitude Decimal? @db.Decimal(10, 7)
-  longitude Decimal? @db.Decimal(10, 7)
-
-  location Unsupported("geography(Point,4326)")?
-
-  datetime DateTime?
-  fingerprintSha String? @db.Char(16)
+  session_key      String                    @id @db.Uuid
+  latitude         Decimal?                  @db.Decimal(10, 7)
+  longitude        Decimal?                  @db.Decimal(10, 7)
+  location         Unsupported("geography")?
+  datetime         DateTime?
+  fingerprintSha   String?                   @db.Char(16)
   browser_language String?
-  page_language String?
-  timezone String?
-  email String?
-
-  ward String?
-  mandal String?
-  district String?
-  pincode String?
-  state String?
-
-  device_type String?
-  source String?
-  probability Decimal? @db.Decimal(5, 4)
-
+  page_language    String?
+  timezone         String?
+  email            String?
+  ward             String?
+  mandal           String?
+  district         String?
+  pincode          String?
+  state            String?
+  device_type      String?
+  source           String?
+  probability      Decimal?                  @db.Decimal(5, 4)
   curation_version String?
-  curated_at DateTime @default(now())
-  updated_at DateTime @default(now()) @updatedAt
+  curated_at       DateTime                  @default(now())
+  updated_at       DateTime                  @default(now()) @updatedAt
 
   @@index([fingerprintSha])
   @@index([email])
@@ -82,5 +69,14 @@ model CuratedData {
   @@index([district])
   @@index([pincode])
   @@index([updated_at])
-  @@index([location], type: Gist, map: "idx_curated_location")
+  @@index([location], map: "idx_curated_location", type: Gist)
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model spatial_ref_sys {
+  srid      Int     @id
+  auth_name String? @db.VarChar(256)
+  auth_srid Int?
+  srtext    String? @db.VarChar(2048)
+  proj4text String? @db.VarChar(2048)
 }
