@@ -104,7 +104,6 @@ export const getRailways = async (
             LIMIT ${Number(limit)};
         `);
 
-     console.log(`Retrieved ${rows.length} rows from the database.`);
 
         const geojson = {
             type: "FeatureCollection",
@@ -122,9 +121,6 @@ export const getRailways = async (
             }))
         };
 
-           console.log(`Converted rows to GeoJSON format with ${geojson.features.length} features.`);
-
-
         res.json({
             success: true,
             count: rows.length,
@@ -133,9 +129,7 @@ export const getRailways = async (
 
 
     } catch(error){
-
         next(error);
-
     }
 
 };

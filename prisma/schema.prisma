@@ -80,3 +80,86 @@ model spatial_ref_sys {
   srtext    String? @db.VarChar(2048)
   proj4text String? @db.VarChar(2048)
 }
+
+model indian_railways {
+  railway_id    BigInt                  @id @default(autoincrement())
+  feature_id    BigInt                  @unique
+  railway_gauge String?                 @db.VarChar(10)
+  state_name    String?                 @db.VarChar(100)
+  city_name     String?                 @db.VarChar(100)
+  track_name    String?                 @db.VarChar(100)
+  shape_length  Float?
+  geometry      Unsupported("geometry")
+  created_at    DateTime                @default(now()) @db.Timestamptz(6)
+
+  @@index([city_name], map: "idx_indian_railways_city_name")
+  @@index([feature_id], map: "idx_indian_railways_feature_id")
+  @@index([geometry], map: "idx_indian_railways_geometry", type: Gist)
+  @@index([railway_gauge], map: "idx_indian_railways_railway_gauge")
+  @@index([state_name], map: "idx_indian_railways_state_name")
+  @@index([track_name], map: "idx_indian_railways_track_name")
+}
+
+model RailwayStation {
+  id            BigInt  @id @default(autoincrement())
+  stationCode   String? @unique @map("station_code")
+  stationName   String  @map("station_name")
+  stationNameHi String? @map("station_name_hi")
+
+  network             String?
+  operator            String?
+  railwayType         String? @map("railway_type")
+  publicTransportType String? @map("public_transport_type")
+  internetAccess      String? @map("internet_access")
+  trainAvailable      Boolean @default(false) @map("train_available")
+
+  geom Unsupported("geometry(Point,4326)")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("railway_stations")
+}
+
+model Airport {
+  id BigInt @id @default(autoincrement())
+
+  osmId   BigInt  @map("osm_id")
+  osmType String? @map("osm_type") @db.VarChar(20)
+
+  airportName String @map("airport_name")
+
+  altName   String? @map("alt_name")
+  shortName String? @map("short_name")
+  intName   String? @map("int_name")
+
+  image String?
+  ref   String? @db.VarChar(10)
+
+  iataCode String? @map("iata_code") @db.VarChar(10)
+  icaoCode String? @map("icao_code") @db.VarChar(10)
+
+  airportType  String? @map("airport_type") @db.VarChar(100)
+  airportClass String? @map("airport_class") @db.VarChar(50)
+
+  city        String?
+  country     String?
+  countryCode String? @map("country_code") @db.Char(2)
+  region      String?
+
+  operator     String?
+  operatorType String? @map("operator_type") @db.VarChar(50)
+  owner        String?
+
+  elevationM Int? @map("elevation_m")
+
+  geom Unsupported("geography(Point,4326)")?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  @@unique([osmId, osmType], map: "airports_osm_unique")
+  @@index([city], map: "airports_city_idx")
+  @@index([countryCode], map: "airports_country_idx")
+  @@map("airports")
+}

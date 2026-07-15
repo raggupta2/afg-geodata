@@ -1,3 +1,4 @@
+import "dotenv/config";
 import app from "./app";
 import fs from "fs";
 import https from "https";
