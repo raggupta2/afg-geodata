@@ -6,6 +6,8 @@ import healthRoutes from "./routes/health.routes";
 import railwayRoutes from "./routes/railway.routes";
 import airportRoutes from "./routes/airport.routes";
 import path from "path";
+import { ApiError } from "./errors/api.error";
+import { logger } from "./config/logger";
 
 const app=express();
 app.use(cors());
@@ -32,20 +34,25 @@ app.use(
         res: Response,
         next: NextFunction
     ) => {
-
-        console.error("API ERROR:", error);
-
         if (res.headersSent) {
             return next(error);
         }
 
-        res.status(500).json({
+        const statusCode = error instanceof ApiError ? error.statusCode : 500;
+        const message = error instanceof ApiError
+            ? error.message
+            : "An unexpected error occurred.";
+
+        logger[statusCode >= 500 ? "error" : "warn"](
+            { error, method: req.method, path: req.path, statusCode },
+            "API request failed"
+        );
+
+        res.status(statusCode).json({
             success: false,
-            message: error.message,
-            stack:
-                process.env.NODE_ENV === "development"
-                    ? error.stack
-                    : undefined
+            message,
+            details: error instanceof ApiError ? error.details : undefined,
+            stack: process.env.NODE_ENV === "development" ? error.stack : undefined
         });
     }
 );
@@ -81,7 +88,8 @@ app.use(
                 ],
 
                 connectSrc: [
-                    "'self'"
+                    "'self'",
+                    "https://nominatim.openstreetmap.org"
                 ],
 
                 upgradeInsecureRequests:

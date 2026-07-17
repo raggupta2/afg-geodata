@@ -1,10 +1,11 @@
-import { NextFunction, Request, Response } from "express";
+﻿import { NextFunction, Request, Response } from "express";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../config/database";
+import { parseNearbyQuery } from "../services/nearby-query.service";
 
 type AirportRow = {
     id: bigint;
-    osm_id: bigint;
+    osm_id: bigint | null;
     osm_type: string | null;
     airport_name: string;
     alt_name: string | null;
@@ -24,6 +25,7 @@ type AirportRow = {
     operator_type: string | null;
     owner: string | null;
     elevation_m: number | null;
+    distance_km: number | null;
     geometry: { type: "Point"; coordinates: [number, number] };
 };
 
@@ -45,6 +47,7 @@ export const getAirports = async (
 ) => {
     try {
         const search = getQueryValue(req.query.q);
+        const nearby = parseNearbyQuery(req.query);
         const countryCode = getQueryValue(req.query.countryCode);
         const requestedLimit = Number(getQueryValue(req.query.limit) ?? 500);
         const limit = Number.isFinite(requestedLimit)
@@ -105,6 +108,9 @@ export const getAirports = async (
             conditions.push(Prisma.sql`country_code = ${countryCode.toUpperCase()}`);
         }
 
+        // Only include airports that have scheduled services
+        conditions.push(Prisma.sql`scheduled_service = true`);
+
         if (suppliedBoundCount === 4) {
             conditions.push(Prisma.sql`
                 geom::geometry && ST_MakeEnvelope(
@@ -133,6 +139,17 @@ export const getAirports = async (
             `
             : Prisma.empty;
 
+        const distance = nearby
+            ? Prisma.sql`ST_Distance(
+                geom,
+                ST_SetSRID(ST_MakePoint(${nearby.longitude}, ${nearby.latitude}), 4326)::geography
+            ) / 1000.0`
+            : Prisma.sql`NULL::double precision`;
+
+        const ordering = nearby
+            ? Prisma.sql`distance_km, airport_name`
+            : Prisma.sql`${ranking} airport_name`;
+
         const rows = await prisma.$queryRaw<AirportRow[]>(Prisma.sql`
             SELECT
                 id,
@@ -156,12 +173,12 @@ export const getAirports = async (
                 operator_type,
                 owner,
                 elevation_m,
+                ${distance} AS distance_km,
                 ST_AsGeoJSON(geom::geometry)::json AS geometry
             FROM airports
             WHERE ${Prisma.join(conditions, " AND ")}
             ORDER BY
-                ${ranking}
-                airport_name
+                ${ordering}
             LIMIT ${limit}
         `);
 
@@ -172,7 +189,7 @@ export const getAirports = async (
                 id: row.id.toString(),
                 properties: {
                     id: row.id.toString(),
-                    osm_id: row.osm_id.toString(),
+                    osm_id: row.osm_id?.toString() ?? null,
                     osm_type: row.osm_type,
                     airport_name: row.airport_name,
                     alt_name: row.alt_name,
@@ -191,7 +208,9 @@ export const getAirports = async (
                     operator: row.operator,
                     operator_type: row.operator_type,
                     owner: row.owner,
-                    elevation_m: row.elevation_m
+                    elevation_m: row.elevation_m,
+                    distance_km: row.distance_km,
+                    address: [row.city, row.region, row.country].filter(Boolean).join(", ") || null
                 },
                 geometry: row.geometry
             }))

@@ -1,6 +1,7 @@
 import { NextFunction, Request, Response } from "express";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../config/database";
+import { parseNearbyQuery } from "../services/nearby-query.service";
 
 type RailwayStationRow = {
     id: bigint;
@@ -13,6 +14,7 @@ type RailwayStationRow = {
     public_transport_type: string | null;
     internet_access: string | null;
     train_available: boolean;
+    distance_km: number | null;
     geometry: { type: "Point"; coordinates: [number, number] };
 };
 
@@ -26,6 +28,7 @@ export const getRailwayStations = async (
 ) => {
     try {
         const search = getQueryValue(req.query.q);
+        const nearby = parseNearbyQuery(req.query);
         const requestedLimit = Number(getQueryValue(req.query.limit) ?? 500);
         const limit = Number.isFinite(requestedLimit)
             ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 1000)
@@ -50,6 +53,17 @@ export const getRailwayStations = async (
             `
             : Prisma.empty;
 
+        const distance = nearby
+            ? Prisma.sql`ST_Distance(
+                geom::geography,
+                ST_SetSRID(ST_MakePoint(${nearby.longitude}, ${nearby.latitude}), 4326)::geography
+            ) / 1000.0`
+            : Prisma.sql`NULL::double precision`;
+
+        const ordering = nearby
+            ? Prisma.sql`distance_km, station_name, station_code NULLS LAST`
+            : Prisma.sql`${ranking} station_name, station_code NULLS LAST`;
+
         const rows = await prisma.$queryRaw<RailwayStationRow[]>(Prisma.sql`
             SELECT
                 id,
@@ -62,14 +76,13 @@ export const getRailwayStations = async (
                 public_transport_type,
                 internet_access,
                 train_available,
+                ${distance} AS distance_km,
                 ST_AsGeoJSON(geom)::json AS geometry
             FROM railway_stations
             WHERE geom IS NOT NULL
             ${searchFilter}
             ORDER BY
-                ${ranking}
-                station_name,
-                station_code NULLS LAST
+                ${ordering}
             LIMIT ${limit}
         `);
 
@@ -88,7 +101,11 @@ export const getRailwayStations = async (
                     railway_type: row.railway_type,
                     public_transport_type: row.public_transport_type,
                     internet_access: row.internet_access,
-                    train_available: row.train_available
+                    train_available: row.train_available,
+                    distance_km: row.distance_km,
+                    address: [row.station_name, row.network, row.operator]
+                        .filter(Boolean)
+                        .join(", ") || null
                 },
                 geometry: row.geometry
             }))

@@ -122,12 +122,16 @@ model RailwayStation {
 }
 
 model Airport {
-  id BigInt @id @default(autoincrement())
+  id       BigInt  @id @default(autoincrement())
+  sourceId BigInt? @unique(map: "airports_source_id_key") @map("source_id")
 
-  osmId   BigInt  @map("osm_id")
+  // OSM metadata is retained for backward compatibility. CSV imports do not
+  // contain an OSM id, so it must remain optional.
+  osmId   BigInt? @map("osm_id")
   osmType String? @map("osm_type") @db.VarChar(20)
 
-  airportName String @map("airport_name")
+  airportName String  @map("airport_name")
+  ident       String? @db.VarChar(20)
 
   altName   String? @map("alt_name")
   shortName String? @map("short_name")
@@ -147,6 +151,16 @@ model Airport {
   countryCode String? @map("country_code") @db.Char(2)
   region      String?
 
+  countryId BigInt? @map("country_id")
+  regionId  BigInt? @map("region_id")
+
+  municipality     String?
+  latitude         Decimal? @db.Decimal(10, 7)
+  longitude        Decimal? @db.Decimal(10, 7)
+  elevationFt      Int?     @map("elevation_ft")
+  timezone         String?  @db.VarChar(100)
+  scheduledService Boolean  @default(false) @map("scheduled_service")
+
   operator     String?
   operatorType String? @map("operator_type") @db.VarChar(50)
   owner        String?
@@ -156,10 +170,165 @@ model Airport {
   geom Unsupported("geography(Point,4326)")?
 
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @default(now()) @map("updated_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  countryRef      Country?           @relation(fields: [countryId], references: [id], onDelete: Restrict)
+  regionRef       Region?            @relation(fields: [regionId], references: [id], onDelete: Restrict)
+  runways         Runway[]
+  frequencies     AirportFrequency[]
+  departingRoutes FlightRoute[]      @relation("FlightRouteSource")
+  arrivingRoutes  FlightRoute[]      @relation("FlightRouteDestination")
 
   @@unique([osmId, osmType], map: "airports_osm_unique")
+  @@index([countryId], map: "airports_country_id_idx")
+  @@index([regionId], map: "airports_region_id_idx")
   @@index([city], map: "airports_city_idx")
   @@index([countryCode], map: "airports_country_idx")
   @@map("airports")
+}
+
+/// Shared reference data. This table is intentionally not aviation-specific,
+/// allowing railway and future transport modules to reuse the same countries.
+model Country {
+  id      BigInt @id @default(autoincrement())
+  isoCode String @unique(map: "countries_iso_code_key") @map("iso_code") @db.Char(2)
+  name    String @db.VarChar(150)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  regions  Region[]
+  airports Airport[]
+  airlines Airline[]
+
+  @@index([name], map: "countries_name_idx")
+  @@map("countries")
+}
+
+/// Shared first-level administrative regions (for example IN-DL or US-CA).
+model Region {
+  id        BigInt @id @default(autoincrement())
+  countryId BigInt @map("country_id")
+  isoRegion String @unique(map: "regions_iso_region_key") @map("iso_region") @db.VarChar(10)
+  name      String @db.VarChar(150)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  country  Country   @relation(fields: [countryId], references: [id], onDelete: Restrict)
+  airports Airport[]
+
+  @@unique([id, countryId], map: "regions_id_country_id_key")
+  @@index([countryId, name], map: "regions_country_name_idx")
+  @@map("regions")
+}
+
+model Runway {
+  id        BigInt  @id @default(autoincrement())
+  sourceId  BigInt? @unique(map: "runways_source_id_key") @map("source_id")
+  airportId BigInt  @map("airport_id")
+  lengthFt  Int?    @map("length_ft")
+  widthFt   Int?    @map("width_ft")
+  surface   String? @db.VarChar(100)
+  lighted   Boolean @default(false)
+  closed    Boolean @default(false)
+  leIdent   String? @map("le_ident") @db.VarChar(20)
+  heIdent   String? @map("he_ident") @db.VarChar(20)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  airport Airport @relation(fields: [airportId], references: [id], onDelete: Cascade)
+
+  @@index([airportId], map: "runways_airport_id_idx")
+  @@map("runways")
+}
+
+model AirportFrequency {
+  id           BigInt  @id @default(autoincrement())
+  sourceId     BigInt? @unique(map: "airport_frequencies_source_id_key") @map("source_id")
+  airportId    BigInt  @map("airport_id")
+  type         String  @db.VarChar(30)
+  description  String?
+  frequencyMhz Decimal @map("frequency_mhz") @db.Decimal(8, 3)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  airport Airport @relation(fields: [airportId], references: [id], onDelete: Cascade)
+
+  @@index([airportId, type], map: "airport_frequencies_airport_type_idx")
+  @@map("airport_frequencies")
+}
+
+model NavigationAid {
+  id        BigInt                                @id @default(autoincrement())
+  sourceId  BigInt?                               @unique(map: "navigation_aids_source_id_key") @map("source_id")
+  ident     String                                @db.VarChar(20)
+  name      String
+  type      String                                @db.VarChar(50)
+  frequency Decimal?                              @db.Decimal(12, 3)
+  latitude  Decimal                               @db.Decimal(10, 7)
+  longitude Decimal                               @db.Decimal(10, 7)
+  elevation Int?
+  geom      Unsupported("geography(Point,4326)")?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@index([ident], map: "navigation_aids_ident_idx")
+  @@index([type], map: "navigation_aids_type_idx")
+  @@index([geom], map: "navigation_aids_geom_idx", type: Gist)
+  @@map("navigation_aids")
+}
+
+model Airline {
+  id        BigInt  @id @default(autoincrement())
+  iataCode  String? @map("iata_code") @db.VarChar(3)
+  icaoCode  String? @map("icao_code") @db.VarChar(4)
+  name      String  @db.VarChar(200)
+  callsign  String? @db.VarChar(100)
+  countryId BigInt? @map("country_id")
+  active    Boolean @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  country Country?      @relation(fields: [countryId], references: [id], onDelete: Restrict)
+  routes  FlightRoute[]
+
+  @@index([countryId, active], map: "airlines_country_active_idx")
+  @@index([name], map: "airlines_name_idx")
+  @@map("airlines")
+}
+
+model FlightRoute {
+  id                   BigInt   @id @default(autoincrement())
+  airlineId            BigInt   @map("airline_id")
+  sourceAirportId      BigInt   @map("source_airport_id")
+  destinationAirportId BigInt   @map("destination_airport_id")
+  sourceIata           String?  @map("source_iata") @db.VarChar(3)
+  destinationIata      String?  @map("destination_iata") @db.VarChar(3)
+  sourceIcao           String?  @map("source_icao") @db.VarChar(4)
+  destinationIcao      String?  @map("destination_icao") @db.VarChar(4)
+  flightNumber         String?  @map("flight_number") @db.VarChar(12)
+  stops                Int      @default(0) @db.SmallInt
+  codeshare            Boolean  @default(false)
+  equipment            String?  @db.VarChar(100)
+  distanceKm           Decimal? @map("distance_km") @db.Decimal(10, 2)
+  durationMinutes      Int?     @map("duration_minutes")
+  active               Boolean  @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  airline            Airline @relation(fields: [airlineId], references: [id], onDelete: Restrict)
+  sourceAirport      Airport @relation("FlightRouteSource", fields: [sourceAirportId], references: [id], onDelete: Restrict)
+  destinationAirport Airport @relation("FlightRouteDestination", fields: [destinationAirportId], references: [id], onDelete: Restrict)
+
+  @@index([sourceAirportId, destinationAirportId, active], map: "flight_routes_source_destination_active_idx")
+  @@index([destinationAirportId, sourceAirportId, active], map: "flight_routes_destination_source_active_idx")
+  @@index([airlineId, sourceAirportId, destinationAirportId, active], map: "flight_routes_airline_route_active_idx")
+  @@index([distanceKm], map: "flight_routes_distance_idx")
+  @@map("flight_routes")
 }
