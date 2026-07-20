@@ -118,7 +118,45 @@ model RailwayStation {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
+  trainStops TrainStop[]
+
   @@map("railway_stations")
+}
+
+model TrainService {
+  id          BigInt  @id @default(autoincrement())
+  trainNumber String  @unique(map: "train_services_train_number_key") @map("train_number") @db.VarChar(20)
+  trainName   String  @map("train_name") @db.VarChar(200)
+  active      Boolean @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  stops TrainStop[]
+
+  @@index([active], map: "train_services_active_idx")
+  @@map("train_services")
+}
+
+model TrainStop {
+  id            BigInt    @id @default(autoincrement())
+  trainId       BigInt    @map("train_id")
+  stationId     BigInt    @map("station_id")
+  sequence      Int
+  arrivalTime   DateTime? @map("arrival_time") @db.Time(0)
+  departureTime DateTime? @map("departure_time") @db.Time(0)
+  dayOffset     Int       @default(0) @map("day_offset")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  train   TrainService   @relation(fields: [trainId], references: [id], onDelete: Cascade)
+  station RailwayStation @relation(fields: [stationId], references: [id], onDelete: Restrict)
+
+  @@unique([trainId, sequence], map: "train_stops_train_sequence_key")
+  @@index([stationId, trainId, sequence], map: "train_stops_station_train_sequence_idx")
+  @@index([trainId, stationId, sequence], map: "train_stops_train_station_sequence_idx")
+  @@map("train_stops")
 }
 
 model Airport {
@@ -302,22 +340,29 @@ model Airline {
   @@map("airlines")
 }
 
+enum FlightDurationSource {
+  SCHEDULE
+  DISTANCE_ESTIMATE
+  MANUAL
+}
+
 model FlightRoute {
-  id                   BigInt   @id @default(autoincrement())
-  airlineId            BigInt   @map("airline_id")
-  sourceAirportId      BigInt   @map("source_airport_id")
-  destinationAirportId BigInt   @map("destination_airport_id")
-  sourceIata           String?  @map("source_iata") @db.VarChar(3)
-  destinationIata      String?  @map("destination_iata") @db.VarChar(3)
-  sourceIcao           String?  @map("source_icao") @db.VarChar(4)
-  destinationIcao      String?  @map("destination_icao") @db.VarChar(4)
-  flightNumber         String?  @map("flight_number") @db.VarChar(12)
-  stops                Int      @default(0) @db.SmallInt
-  codeshare            Boolean  @default(false)
-  equipment            String?  @db.VarChar(100)
-  distanceKm           Decimal? @map("distance_km") @db.Decimal(10, 2)
-  durationMinutes      Int?     @map("duration_minutes")
-  active               Boolean  @default(true)
+  id                   BigInt                @id @default(autoincrement())
+  airlineId            BigInt                @map("airline_id")
+  sourceAirportId      BigInt                @map("source_airport_id")
+  destinationAirportId BigInt                @map("destination_airport_id")
+  sourceIata           String?               @map("source_iata") @db.VarChar(3)
+  destinationIata      String?               @map("destination_iata") @db.VarChar(3)
+  sourceIcao           String?               @map("source_icao") @db.VarChar(4)
+  destinationIcao      String?               @map("destination_icao") @db.VarChar(4)
+  flightNumber         String?               @map("flight_number") @db.VarChar(12)
+  stops                Int                   @default(0) @db.SmallInt
+  codeshare            Boolean               @default(false)
+  equipment            String?               @db.VarChar(100)
+  distanceKm           Decimal?              @map("distance_km") @db.Decimal(10, 2)
+  durationMinutes      Int?                  @map("duration_minutes")
+  durationSource       FlightDurationSource? @map("duration_source")
+  active               Boolean               @default(true)
 
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
@@ -331,4 +376,26 @@ model FlightRoute {
   @@index([airlineId, sourceAirportId, destinationAirportId, active], map: "flight_routes_airline_route_active_idx")
   @@index([distanceKm], map: "flight_routes_distance_idx")
   @@map("flight_routes")
+}
+
+model FlightSchedule {
+  id                BigInt   @id @default(autoincrement())
+  airlineCode       String   @map("airline_code") @db.Char(2)
+  airlineName       String   @map("airline_name")
+  flightNumber      String   @map("flight_number") @db.VarChar(8)
+  departureAirport  String   @map("departure_airport") @db.Char(3)
+  arrivalAirport    String   @map("arrival_airport") @db.Char(3)
+  departureTerminal String?  @map("departure_terminal") @db.VarChar(5)
+  arrivalTerminal   String?  @map("arrival_terminal") @db.VarChar(5)
+  departureTime     DateTime @map("departure_time") @db.Timestamptz(6)
+  arrivalTime       DateTime @map("arrival_time") @db.Timestamptz(6)
+  aircraftType      String?  @map("aircraft_type") @db.VarChar(20)
+  frequency         String?  @db.VarChar(20)
+  status            String?  @db.VarChar(20)
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@unique([airlineCode, flightNumber, departureAirport, departureTime], map: "flight_schedules_instance_key")
+  @@index([departureAirport, arrivalAirport, departureTime], map: "flight_schedules_route_departure_idx")
+  @@index([flightNumber, departureTime], map: "flight_schedules_flight_departure_idx")
+  @@map("flight_schedules")
 }

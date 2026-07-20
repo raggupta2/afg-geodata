@@ -29,7 +29,7 @@ CREATE TABLE "regions" (
 
     CONSTRAINT "regions_pkey" PRIMARY KEY ("id"),
     CONSTRAINT "regions_iso_region_format_check"
-        CHECK ("iso_region" = UPPER("iso_region") AND BTRIM("iso_region") ~ '^[A-Z]{2}-[A-Z0-9]{1,7}$'),
+        CHECK ("iso_region" = UPPER("iso_region") AND BTRIM("iso_region") ~ '^[A-Z]{2}(-[A-Z0-9]+)+$'),
     CONSTRAINT "regions_name_not_blank_check"
         CHECK (BTRIM("name") <> ''),
     CONSTRAINT "regions_country_id_fkey"

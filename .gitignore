@@ -9,3 +9,6 @@ ssl/
 *.log__pycache__/
 *.py[cod]
 scripts/
+!scripts/
+scripts/*
+AGENTS.md
