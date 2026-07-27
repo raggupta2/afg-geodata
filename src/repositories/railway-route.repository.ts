@@ -55,7 +55,7 @@ export async function findRailwayStationByCode(
             id,
             station_code AS code,
             station_name AS name
-        FROM railway_stations
+        FROM railway_station
         WHERE station_code = ${code}
         LIMIT 1
     `);
@@ -95,24 +95,22 @@ export async function findDirectTrainRoutes(
                 service.train_name AS "trainName",
                 TO_CHAR(source_stop.departure_time, 'HH24:MI:SS') AS "departureTime",
                 TO_CHAR(destination_stop.arrival_time, 'HH24:MI:SS') AS "arrivalTime",
-                (
-                    destination_stop.day_offset * 1440
-                    + EXTRACT(EPOCH FROM destination_stop.arrival_time) / 60
-                    - source_stop.day_offset * 1440
-                    - EXTRACT(EPOCH FROM source_stop.departure_time) / 60
-                )::INTEGER AS "durationMinutes",
+                (destination_stop.arrival_minute - source_stop.departure_minute)::INTEGER
+                    AS "durationMinutes",
                 (destination_stop.sequence - source_stop.sequence - 1)::INTEGER AS "numberOfStops"
             FROM train_stops source_stop
             JOIN train_stops destination_stop
               ON destination_stop.train_id = source_stop.train_id
              AND destination_stop.sequence > source_stop.sequence
-            JOIN train_services service
+            JOIN "train" service
               ON service.id = source_stop.train_id
              AND service.active = true
             WHERE source_stop.station_id = ${source.databaseId}
               AND destination_stop.station_id = ${destination.databaseId}
-              AND source_stop.departure_time IS NOT NULL
-              AND destination_stop.arrival_time IS NOT NULL
+              AND source_stop.departure_minute IS NOT NULL
+              AND destination_stop.arrival_minute IS NOT NULL
+              AND source_stop.boarding_allowed = true
+              AND destination_stop.alighting_allowed = true
         )
         SELECT *
         FROM direct_trains
@@ -157,24 +155,13 @@ export async function findOneStopTrainRoutes(
                 TO_CHAR(first_transfer.arrival_time, 'HH24:MI:SS') AS "transferArrivalTime",
                 TO_CHAR(second_transfer.departure_time, 'HH24:MI:SS') AS "transferDepartureTime",
                 TO_CHAR(destination_stop.arrival_time, 'HH24:MI:SS') AS "arrivalTime",
-                (
-                    first_transfer.day_offset * 1440
-                    + EXTRACT(EPOCH FROM first_transfer.arrival_time) / 60
-                    - source_stop.day_offset * 1440
-                    - EXTRACT(EPOCH FROM source_stop.departure_time) / 60
-                )::INTEGER AS "firstDurationMinutes",
-                (
-                    destination_stop.day_offset * 1440
-                    + EXTRACT(EPOCH FROM destination_stop.arrival_time) / 60
-                    - second_transfer.day_offset * 1440
-                    - EXTRACT(EPOCH FROM second_transfer.departure_time) / 60
-                )::INTEGER AS "secondDurationMinutes",
+                (first_transfer.arrival_minute - source_stop.departure_minute)::INTEGER
+                    AS "firstDurationMinutes",
+                (destination_stop.arrival_minute - second_transfer.departure_minute)::INTEGER
+                    AS "secondDurationMinutes",
                 MOD(
-                    (
-                        EXTRACT(EPOCH FROM second_transfer.departure_time) / 60
-                        - EXTRACT(EPOCH FROM first_transfer.arrival_time) / 60
-                        + 1440
-                    )::INTEGER,
+                    MOD(second_transfer.departure_minute - first_transfer.arrival_minute, 1440)
+                    + 1440,
                     1440
                 )::INTEGER AS "transferWaitMinutes",
                 (first_transfer.sequence - source_stop.sequence - 1)::INTEGER
@@ -191,22 +178,26 @@ export async function findOneStopTrainRoutes(
             JOIN train_stops destination_stop
               ON destination_stop.train_id = second_transfer.train_id
              AND destination_stop.sequence > second_transfer.sequence
-            JOIN train_services first_service
+            JOIN "train" first_service
               ON first_service.id = source_stop.train_id
              AND first_service.active = true
-            JOIN train_services second_service
+            JOIN "train" second_service
               ON second_service.id = second_transfer.train_id
              AND second_service.active = true
-            JOIN railway_stations transfer_station
+            JOIN railway_station transfer_station
               ON transfer_station.id = first_transfer.station_id
             WHERE source_stop.station_id = ${source.databaseId}
               AND destination_stop.station_id = ${destination.databaseId}
               AND first_transfer.station_id <> ${source.databaseId}
               AND first_transfer.station_id <> ${destination.databaseId}
-              AND source_stop.departure_time IS NOT NULL
-              AND first_transfer.arrival_time IS NOT NULL
-              AND second_transfer.departure_time IS NOT NULL
-              AND destination_stop.arrival_time IS NOT NULL
+              AND source_stop.departure_minute IS NOT NULL
+              AND first_transfer.arrival_minute IS NOT NULL
+              AND second_transfer.departure_minute IS NOT NULL
+              AND destination_stop.arrival_minute IS NOT NULL
+              AND source_stop.boarding_allowed = true
+              AND first_transfer.alighting_allowed = true
+              AND second_transfer.boarding_allowed = true
+              AND destination_stop.alighting_allowed = true
         ), valid_candidates AS (
             SELECT
                 *,

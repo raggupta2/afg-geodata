@@ -11,4 +11,5 @@ ssl/
 scripts/
 !scripts/
 scripts/*
+!scripts/import_train_timetables.py
 AGENTS.md

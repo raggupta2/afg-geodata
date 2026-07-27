@@ -63,7 +63,6 @@ const railwayStationLayer = L.geoJSON(null, {
             <div class="map-popup">
                 <h3>${escapeHtml(station.station_name)}</h3>
                 ${detailRow("Station code", station.station_code)}
-                ${detailRow("Hindi name", station.station_name_hi)}
                 ${detailRow("Network", station.network)}
                 ${detailRow("Operator", station.operator)}
                 ${detailRow("Railway type", station.railway_type)}

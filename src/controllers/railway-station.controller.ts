@@ -7,7 +7,6 @@ type RailwayStationRow = {
     id: bigint;
     station_code: string | null;
     station_name: string;
-    station_name_hi: string | null;
     network: string | null;
     operator: string | null;
     railway_type: string | null;
@@ -69,7 +68,6 @@ export const getRailwayStations = async (
                 id,
                 station_code,
                 station_name,
-                station_name_hi,
                 network,
                 operator,
                 railway_type,
@@ -78,7 +76,7 @@ export const getRailwayStations = async (
                 train_available,
                 ${distance} AS distance_km,
                 ST_AsGeoJSON(geom)::json AS geometry
-            FROM railway_stations
+            FROM railway_station
             WHERE geom IS NOT NULL
             ${searchFilter}
             ORDER BY
@@ -95,7 +93,6 @@ export const getRailwayStations = async (
                     id: row.id.toString(),
                     station_code: row.station_code,
                     station_name: row.station_name,
-                    station_name_hi: row.station_name_hi,
                     network: row.network,
                     operator: row.operator,
                     railway_type: row.railway_type,

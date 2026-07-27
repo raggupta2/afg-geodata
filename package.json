@@ -9,7 +9,7 @@
     "start": "node dist/server.js",
     "test:flight-routes": "npm run build && node --test --test-concurrency=1 scripts/test-flight-routes.js",
     "test:flight-schedules": "npm run build && node --test --test-concurrency=1 scripts/test-flight-schedules.js",
-    "test:railway-routes": "npm run build && node --test --test-concurrency=1 scripts/test-railway-routes.js",
+    "test:railway-routes": "npm run build && node --test --test-concurrency=1 scripts/test-railway-runs-mask.js scripts/test-railway-routes.js",
     "data:flight-durations": "npm run build && node dist/maintenance/populate-flight-route-durations.js",
     "data:quality": "npm run build && node dist/maintenance/check-data-quality.js",
     "data:import-trains": "python scripts/import_train_timetables.py",
