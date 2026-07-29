@@ -14,6 +14,8 @@ type ConnectionRow = {
     arrivalMinute: number;
     boardingAllowed: boolean;
     alightingAllowed: boolean;
+    fromDistanceKm: number | null;
+    toDistanceKm: number | null;
     fromStationId: bigint;
     fromStationCode: string;
     fromStationName: string;
@@ -28,9 +30,31 @@ export async function findJourneyStationByCode(
     code: string
 ): Promise<ResolvedJourneyStation | null> {
     const rows = await prisma.$queryRaw<StationRow[]>(Prisma.sql`
-        SELECT id, station_code AS code, station_name AS name
-        FROM railway_station
-        WHERE station_code = ${code}
+        SELECT
+            candidate.id,
+            candidate.station_code AS code,
+            candidate.station_name AS name
+        FROM railway_station requested
+        JOIN railway_station candidate
+          ON candidate.id = requested.id
+          OR (
+              NOT EXISTS (
+                  SELECT 1
+                  FROM train_stops requested_stop
+                  WHERE requested_stop.station_id = requested.id
+              )
+              AND ST_DWithin(candidate.geom, requested.geom, 0.0001)
+          )
+        WHERE requested.station_code = ${code}
+          AND candidate.station_code IS NOT NULL
+        ORDER BY
+            EXISTS (
+                SELECT 1
+                FROM train_stops candidate_stop
+                WHERE candidate_stop.station_id = candidate.id
+            ) DESC,
+            (candidate.id = requested.id) DESC,
+            candidate.train_available DESC
         LIMIT 1
     `);
     const station = rows[0];
@@ -83,6 +107,8 @@ export async function findJourneyConnections(
             connection.arrival_minute AS "arrivalMinute",
             from_stop.boarding_allowed AS "boardingAllowed",
             to_stop.alighting_allowed AS "alightingAllowed",
+            from_stop.distance_km::DOUBLE PRECISION AS "fromDistanceKm",
+            to_stop.distance_km::DOUBLE PRECISION AS "toDistanceKm",
             from_station.id AS "fromStationId",
             from_station.station_code AS "fromStationCode",
             from_station.station_name AS "fromStationName",
@@ -117,6 +143,8 @@ export async function findJourneyConnections(
         arrivalMinute: row.arrivalMinute,
         boardingAllowed: row.boardingAllowed,
         alightingAllowed: row.alightingAllowed,
+        fromDistanceKm: row.fromDistanceKm,
+        toDistanceKm: row.toDistanceKm,
         fromStation: {
             id: row.fromStationId.toString(),
             code: row.fromStationCode,

@@ -52,9 +52,8 @@ async function loadRoute() {
 
         if (
             !data.success ||
-            !data.data ||
-            !data.data.legs ||
-            data.data.legs.length === 0
+            !Array.isArray(data.data) ||
+            data.data.length === 0
         ) {
 
             result.innerHTML = `
@@ -82,120 +81,161 @@ async function loadRoute() {
 
 }
 
-function renderRouteTable(route) {
+function renderRouteTable(routes) {
     let html = `
-    <div class="card">
-    <h2>
-        Route Summary
-    </h2>
-
-    <table>
-    <tr>
-        <th>From</th>
-        <td>
-            ${route.departureStation.name}
-            (${route.departureStation.code})
-        </td>
-    </tr>
-
-    <tr>
-        <th>To</th>
-        <td>
-            ${route.arrivalStation.name}
-            (${route.arrivalStation.code})
-        </td>
-    </tr>
-
-    <tr>
-        <th>Date</th>
-        <td>
-            ${route.searchDate}
-        </td>
-    </tr>
-
-    <tr>
-        <th>Total Duration</th>
-        <td>
-            ${formatDuration(route.totalDurationMinutes)}
-        </td>
-    </tr>
-
-    <tr>
-        <th>Transfers</th>
-        <td>
-            ${route.numberOfTransfers}
-        </td>
-    </tr>
-
-    </table>
-
-    <h2>
-        Train Details
-    </h2>
-    <table>
-    <tr>
-        <th>No</th>
-        <th>Train No</th>
-        <th>Train Name</th>
-        <th>From</th>
-        <th>Departure</th>
-        <th>To</th>
-        <th>Arrival</th>
-        <th>Duration</th>
-        <th>Stops</th>
-    </tr>
+        <div class="results-header">
+            <h2>Available Journeys</h2>
+            <div class="route-count">
+                ${routes.length} ${routes.length === 1 ? "route" : "routes"} found
+            </div>
+        </div>
     `;
 
+    routes.forEach((journey, routeIndex) => {
+        const routeStations = [
+            journey.legs[0].departureStation,
+            ...journey.legs.map(train => train.arrivalStation)
+        ];
+        const routePath = routeStations
+            .map(station => station.code)
+            .join(" &rarr; ");
+        const totalDistanceKm = calculateJourneyDistance(journey);
+        const totalJourneyMinutes = calculateJourneyDuration(journey);
+        const trainChanges = Math.max(0, journey.legs.length - 1);
 
-
-    route.legs.forEach((train, index) => {
         html += `
-        <tr>
-        <td>
-            ${index + 1}
-        </td>
-        <td>
-            ${train.trainNumber}
-        </td>
-        <td>
-            ${train.trainName}
-        </td>
-        <td>
-            ${train.departureStation.name}
-            (${train.departureStation.code})
-        </td>
-        <td>
-            ${train.departureDateTime}
-        </td>
-        <td>
-            ${train.arrivalStation.name}
-            (${train.arrivalStation.code})
-        </td>
-        <td>
-            ${train.arrivalDateTime}
-        </td>
-        <td>
-            ${formatDuration(train.durationMinutes)}
-        </td>
-        <td>
-            ${train.numberOfStops}
-        </td>
-        </tr>
+            <section class="journey-card">
+                <div class="journey-header">
+                    <span class="route-number">${routeIndex + 1}</span>
+                    <div class="route-path">${routePath}</div>
+                </div>
+
+                <div class="journey-metrics">
+                    <div class="journey-metric">
+                        <span>Total Distance</span>
+                        <strong>${formatDistance(totalDistanceKm)}</strong>
+                    </div>
+                    <div class="journey-metric">
+                        <span>Total Journey Time</span>
+                        <strong>${formatDuration(totalJourneyMinutes)}</strong>
+                    </div>
+                    <div class="journey-metric">
+                        <span>Train Changes</span>
+                        <strong>${trainChanges}</strong>
+                    </div>
+                </div>
+
+                <div class="journey-table">
+                    <table>
+                        <tr>
+                            <th>Leg</th>
+                            <th>Train No</th>
+                            <th>Train Name</th>
+                            <th>From</th>
+                            <th>Departure</th>
+                            <th>To</th>
+                            <th>Arrival</th>
+                            <th>Travel Time</th>
+                            <th>Layover</th>
+                            <th>Distance</th>
+                            <th>Stops</th>
+                        </tr>
+        `;
+
+        journey.legs.forEach((train, legIndex) => {
+            const previousTrain = journey.legs[legIndex - 1];
+            const layoverMinutes = previousTrain
+                ? calculateLayover(previousTrain, train)
+                : null;
+
+            html += `
+                <tr>
+                    <td>${legIndex + 1}</td>
+                    <td>${train.trainNumber}</td>
+                    <td>${train.trainName}</td>
+                    <td>
+                        ${train.departureStation.name}
+                        (${train.departureStation.code})
+                    </td>
+                    <td>${formatDateTime(train.departureDateTime)}</td>
+                    <td>
+                        ${train.arrivalStation.name}
+                        (${train.arrivalStation.code})
+                    </td>
+                    <td>${formatDateTime(train.arrivalDateTime)}</td>
+                    <td>${formatDuration(train.durationMinutes)}</td>
+                    <td>
+                        ${layoverMinutes === null
+                            ? "—"
+                            : formatDuration(layoverMinutes)}
+                    </td>
+                    <td>${formatDistance(train.totalDistanceKm)}</td>
+                    <td>${train.numberOfStops}</td>
+                </tr>
+            `;
+        });
+
+        html += `
+                    </table>
+                </div>
+            </section>
         `;
     });
-
-    html += `
-    </table>
-    </div>
-    `;
 
     document.getElementById("result").innerHTML = html;
 }
 
 function formatDuration(minutes) {
+    if (!Number.isFinite(minutes)) return "Not available";
     const hours = Math.floor(minutes / 60);
     const mins = minutes % 60;
-    return `${hours} hours ${mins} minutes`;
+    return `${hours}h ${mins}m`;
+}
+
+function formatDistance(distanceKm) {
+    return !Number.isFinite(distanceKm)
+        ? "Not available"
+        : `${distanceKm.toLocaleString()} km`;
+}
+
+function formatDateTime(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+    });
+}
+
+function calculateJourneyDistance(journey) {
+    const distances = journey.legs.map(train => train.totalDistanceKm);
+    if (distances.every(Number.isFinite)) {
+        return distances.reduce((total, distance) => total + distance, 0);
+    }
+    return Number.isFinite(journey.totalDistanceKm)
+        ? journey.totalDistanceKm
+        : null;
+}
+
+function calculateJourneyDuration(journey) {
+    const departure = Date.parse(journey.departureDateTime);
+    const arrival = Date.parse(journey.arrivalDateTime);
+    if (Number.isFinite(departure) && Number.isFinite(arrival)) {
+        return Math.max(0, Math.round((arrival - departure) / 60000));
+    }
+    return journey.totalDurationMinutes;
+}
+
+function calculateLayover(previousTrain, train) {
+    const arrival = Date.parse(previousTrain.arrivalDateTime);
+    const departure = Date.parse(train.departureDateTime);
+    if (!Number.isFinite(arrival) || !Number.isFinite(departure)) {
+        return null;
+    }
+    return Math.max(0, Math.round((departure - arrival) / 60000));
 }
 
 

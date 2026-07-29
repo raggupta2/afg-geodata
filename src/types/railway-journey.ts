@@ -15,6 +15,8 @@ export type JourneyConnection = {
     arrivalMinute: number;
     boardingAllowed: boolean;
     alightingAllowed: boolean;
+    fromDistanceKm: number | null;
+    toDistanceKm: number | null;
     fromStation: JourneyStation;
     toStation: JourneyStation;
 };
@@ -29,7 +31,9 @@ export type RailwayJourneyLeg = {
     departureDateTime: string;
     arrivalDateTime: string;
     durationMinutes: number;
+    totalDistanceKm: number | null;
     numberOfStops: number;
+    stations: JourneyStation[];
 };
 
 export type RailwayJourney = {
@@ -43,6 +47,9 @@ export type RailwayJourney = {
     departureDateTime: string;
     arrivalDateTime: string;
     totalDurationMinutes: number;
+    totalDistanceKm: number | null;
+    numberOfStops: number;
     numberOfTransfers: number;
+    stations: JourneyStation[];
     legs: RailwayJourneyLeg[];
 };

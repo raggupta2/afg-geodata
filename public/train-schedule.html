@@ -53,6 +53,91 @@
             overflow-x: auto;
         }
 
+        .results-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 15px;
+            margin-bottom: 18px;
+        }
+
+        .results-header h2 {
+            margin: 0;
+        }
+
+        .route-count {
+            color: #0066cc;
+            font-weight: bold;
+        }
+
+        .journey-card {
+            background: white;
+            border: 1px solid #dfe4ea;
+            border-radius: 12px;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+
+        .journey-header {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 18px 20px;
+            background: #f7faff;
+            border-bottom: 1px solid #dfe4ea;
+        }
+
+        .route-number {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 34px;
+            height: 34px;
+            padding: 0 8px;
+            border-radius: 18px;
+            background: #0066cc;
+            color: white;
+            font-weight: bold;
+        }
+
+        .route-path {
+            color: #1f2937;
+            font-size: 20px;
+            font-weight: bold;
+            line-height: 1.4;
+        }
+
+        .journey-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+            padding: 18px 20px 4px;
+        }
+
+        .journey-metric {
+            padding: 14px;
+            border-radius: 8px;
+            background: #f8f8f8;
+        }
+
+        .journey-metric span {
+            display: block;
+            margin-bottom: 5px;
+            color: #6b7280;
+            font-size: 13px;
+        }
+
+        .journey-metric strong {
+            color: #1f2937;
+            font-size: 17px;
+        }
+
+        .journey-table {
+            padding: 0 20px 20px;
+            overflow-x: auto;
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
@@ -146,6 +231,26 @@
 
         .suggestions li:hover {
             background: #f2f2f2;
+        }
+
+        @media (max-width: 700px) {
+            body {
+                padding: 12px;
+            }
+
+            .results-header,
+            .journey-header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .journey-metrics {
+                grid-template-columns: 1fr;
+            }
+
+            .route-path {
+                font-size: 17px;
+            }
         }
     </style>
 </head>
