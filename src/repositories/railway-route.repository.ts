@@ -3,8 +3,10 @@ import { prisma } from "../config/database";
 import {
     RailwayItinerary,
     RailwayStationSummary,
-    TrainRouteLeg
+    TrainRouteLeg,
+    TrainRunDays
 } from "../types/railway-route";
+import { decodeRailwayRunsMask } from "../utils/railway-runs-mask";
 
 type StationRow = {
     id: bigint;
@@ -19,13 +21,19 @@ type DirectTrainRow = {
     arrivalTime: string;
     durationMinutes: number;
     numberOfStops: number;
+    totalDistanceKm: number | null;
+    runsMask: number;
 };
 
 type OneStopTrainRow = {
     firstTrainNumber: string;
     firstTrainName: string;
+    firstTotalDistanceKm: number | null;
+    firstRunsMask: number;
     secondTrainNumber: string;
     secondTrainName: string;
+    secondTotalDistanceKm: number | null;
+    secondRunsMask: number;
     transferStationId: bigint;
     transferStationCode: string;
     transferStationName: string;
@@ -69,6 +77,19 @@ export async function findRailwayStationByCode(
     };
 }
 
+function toRunDays(runsMask: number): TrainRunDays {
+    const runDays = decodeRailwayRunsMask(runsMask);
+    return {
+        M: runDays.includes("monday"),
+        T: runDays.includes("tuesday"),
+        W: runDays.includes("wednesday"),
+        Th: runDays.includes("thursday"),
+        F: runDays.includes("friday"),
+        S: runDays.includes("saturday"),
+        Su: runDays.includes("sunday")
+    };
+}
+
 const directLeg = (
     row: DirectTrainRow,
     source: RailwayStationSummary,
@@ -81,7 +102,9 @@ const directLeg = (
     departureTime: row.departureTime,
     arrivalTime: row.arrivalTime,
     durationMinutes: row.durationMinutes,
-    numberOfStops: row.numberOfStops
+    numberOfStops: row.numberOfStops,
+    distanceKm: row.totalDistanceKm ?? undefined,
+    runDays: toRunDays(row.runsMask)
 });
 
 export async function findDirectTrainRoutes(
@@ -97,7 +120,9 @@ export async function findDirectTrainRoutes(
                 TO_CHAR(destination_stop.arrival_time, 'HH24:MI:SS') AS "arrivalTime",
                 (destination_stop.arrival_minute - source_stop.departure_minute)::INTEGER
                     AS "durationMinutes",
-                (destination_stop.sequence - source_stop.sequence - 1)::INTEGER AS "numberOfStops"
+                (destination_stop.sequence - source_stop.sequence - 1)::INTEGER AS "numberOfStops",
+                COALESCE(destination_stop.distance_km - source_stop.distance_km, 0)::DOUBLE PRECISION AS "totalDistanceKm",
+                service.runs_mask AS "runsMask"
             FROM train_stops source_stop
             JOIN train_stops destination_stop
               ON destination_stop.train_id = source_stop.train_id
@@ -146,8 +171,12 @@ export async function findOneStopTrainRoutes(
             SELECT
                 first_service.train_number AS "firstTrainNumber",
                 first_service.train_name AS "firstTrainName",
+                COALESCE(first_destination.distance_km - source_stop.distance_km, 0)::DOUBLE PRECISION AS "firstTotalDistanceKm",
+                first_service.runs_mask AS "firstRunsMask",
                 second_service.train_number AS "secondTrainNumber",
                 second_service.train_name AS "secondTrainName",
+                COALESCE(destination_stop.distance_km - second_transfer.distance_km, 0)::DOUBLE PRECISION AS "secondTotalDistanceKm",
+                second_service.runs_mask AS "secondRunsMask",
                 transfer_station.id AS "transferStationId",
                 transfer_station.station_code AS "transferStationCode",
                 transfer_station.station_name AS "transferStationName",
@@ -175,6 +204,10 @@ export async function findOneStopTrainRoutes(
             JOIN train_stops second_transfer
               ON second_transfer.station_id = first_transfer.station_id
              AND second_transfer.train_id <> first_transfer.train_id
+            JOIN train_stops first_destination
+              ON first_destination.train_id = source_stop.train_id
+             AND first_destination.sequence > source_stop.sequence
+             AND first_destination.station_id = first_transfer.station_id
             JOIN train_stops destination_stop
               ON destination_stop.train_id = second_transfer.train_id
              AND destination_stop.sequence > second_transfer.sequence
@@ -216,8 +249,12 @@ export async function findOneStopTrainRoutes(
         SELECT
             "firstTrainNumber",
             "firstTrainName",
+            "firstTotalDistanceKm",
+            "firstRunsMask",
             "secondTrainNumber",
             "secondTrainName",
+            "secondTotalDistanceKm",
+            "secondRunsMask",
             "transferStationId",
             "transferStationCode",
             "transferStationName",
@@ -262,7 +299,9 @@ export async function findOneStopTrainRoutes(
                     departureTime: row.departureTime,
                     arrivalTime: row.transferArrivalTime,
                     durationMinutes: row.firstDurationMinutes,
-                    numberOfStops: row.firstNumberOfStops
+                    numberOfStops: row.firstNumberOfStops,
+                    distanceKm: row.firstTotalDistanceKm ?? undefined,
+                    runDays: toRunDays(row.firstRunsMask)
                 },
                 {
                     trainNumber: row.secondTrainNumber,
@@ -272,7 +311,9 @@ export async function findOneStopTrainRoutes(
                     departureTime: row.transferDepartureTime,
                     arrivalTime: row.arrivalTime,
                     durationMinutes: row.secondDurationMinutes,
-                    numberOfStops: row.secondNumberOfStops
+                    numberOfStops: row.secondNumberOfStops,
+                    distanceKm: row.secondTotalDistanceKm ?? undefined,
+                    runDays: toRunDays(row.secondRunsMask)
                 }
             ]
         };

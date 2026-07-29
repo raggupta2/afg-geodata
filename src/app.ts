@@ -6,6 +6,7 @@ import healthRoutes from "./routes/health.routes";
 import railwayRoutes from "./routes/railway.routes";
 import airportRoutes from "./routes/airport.routes";
 import flightRoutes from "./routes/flight.routes";
+import routeRoutes from "./routes/route.routes";
 import path from "path";
 import { ApiError } from "./errors/api.error";
 import { logger } from "./config/logger";
@@ -28,6 +29,7 @@ app.use(
 app.use("/api/v1/railways", railwayRoutes );
 app.use("/api/v1/airports", airportRoutes);
 app.use("/api/v1/flights", flightRoutes);
+app.use("/api/routes", routeRoutes);
 
 app.use(
     (

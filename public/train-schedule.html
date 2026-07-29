@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Railway Route Search</title>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f2f4f7;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #333;
+        }
+        .search-box {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px #ccc;
+            margin-bottom: 20px;
+        }
+
+        input,
+        button {
+            padding: 10px;
+            margin: 5px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+        }
+
+
+        button {
+            background: #0066cc;
+            color: white;
+            cursor: pointer;
+            border: none;
+        }
+
+
+        button:hover {
+            background: #004999;
+        }
+
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 5px #ccc;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        th {
+            background: #0066cc;
+            color: white;
+            padding: 12px;
+            border: 1px solid #ddd;
+        }
+
+
+
+        td {
+            padding: 10px;
+            border: 1px solid #ddd;
+            text-align: center;
+        }
+
+        tr:nth-child(even) {
+            background: #f8f8f8;
+        }
+
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+
+        #loader {
+            text-align: center;
+            padding: 20px;
+            font-size: 18px;
+            color: #0066cc;
+            font-weight: bold;
+        }
+
+        .spinner {
+            width: 35px;
+            height: 35px;
+            border: 5px solid #ddd;
+            border-top: 5px solid #0066cc;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: auto;
+        }
+
+        @keyframes spin {
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        .empty-result {
+            background: white;
+            padding: 20px;
+            margin-top:20px;
+            border-radius:10px;
+            text-align:center;
+            color:#777;
+            font-size:18px;
+        }
+
+        .autocomplete {
+            position: relative;
+            display: inline-block;
+        }
+
+        .suggestions {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            margin: 0;
+            padding: 0;
+            list-style: none;
+            background: #fff;
+            border: 1px solid #ccc;
+            border-top: none;
+            max-height: 250px;
+            overflow-y: auto;
+            z-index: 1000;
+            display: none;
+        }
+
+        .suggestions li {
+            padding: 10px;
+            cursor: pointer;
+        }
+
+        .suggestions li:hover {
+            background: #f2f2f2;
+        }
+    </style>
+</head>
+
+<body>
+    <h1> Railway Route Finder </h1>
+    <div class="search-box">
+
+        <div class="autocomplete">
+            <label>From:</label>
+            <input id="departure" type="text" placeholder="Station Code or Name" autocomplete="off">
+            <ul id="departureSuggestions" class="suggestions"></ul>
+        </div>
+
+
+        <div class="autocomplete">
+            <label>To:</label>
+            <input id="arrival" type="text" placeholder="Station Code or Name" autocomplete="off">
+            <ul id="arrivalSuggestions" class="suggestions"></ul>
+        </div>
+
+        <label>  Date: </label>
+
+        <input id="date" type="date">
+
+        <button id="searchBtn" type="button">
+            Search Route
+        </button>
+
+    </div>
+
+    <div id="loader" style="display:none;"> Loading railway data... </div>
+
+    <div id="result"></div>
+
+    <script src="/config.js"></script>
+    <script src="leaflet/train-schedule.js"></script>
+</body>
+</html>

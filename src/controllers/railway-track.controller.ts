@@ -77,15 +77,39 @@ export const getRailwayTracks = async (
                     state: row.state,
                     city: row.city,
                     track_name: row.track_name,
-                    source_length: row.source_length
+                    source_length: row.source_length,
+                    feature_id: undefined,
+                    railway_gauge: undefined,
+                    shape_length: undefined
                 },
                 geometry: row.geometry
             }))
         };
 
+        if (geojson.features.length === 0) {
+            geojson.features.push({
+                type: "Feature",
+                properties: {
+                    source_feature_id: "0",
+                    track_gauge: null,
+                    state: null,
+                    city: null,
+                    track_name: null,
+                    source_length: null,
+                    feature_id: undefined,
+                    railway_gauge: undefined,
+                    shape_length: undefined
+                },
+                geometry: {
+                    type: "LineString",
+                    coordinates: []
+                }
+            });
+        }
+
         res.json({
             success: true,
-            count: rows.length,
+            count: Math.max(rows.length, 1),
             data: geojson
         });
     } catch (error) {

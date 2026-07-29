@@ -15,6 +15,24 @@ export type TrainRouteLeg = {
     arrivalTime: string;
     durationMinutes: number;
     numberOfStops: number;
+    distanceKm?: number;
+    runDays?: TrainRunDays;
+};
+
+export type TrainRunDays = {
+    M: boolean;
+    T: boolean;
+    W: boolean;
+    Th: boolean;
+    F: boolean;
+    S: boolean;
+    Su: boolean;
+};
+
+export type TrainSummary = {
+    distance: string;
+    totalKms: number;
+    runDays: TrainRunDays;
 };
 
 export type RailwayItinerary = {
@@ -28,4 +46,5 @@ export type RailwayItinerary = {
     numberOfStops: number;
     transferStation: RailwayStationSummary | null;
     trains: TrainRouteLeg[];
+    summary?: TrainSummary;
 };
