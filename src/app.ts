@@ -1,20 +1,22 @@
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import helmet from "helmet";
+import pinoHttp from "pino-http";
 import collectRoutes from "./routes/collect.routes";
 import healthRoutes from "./routes/health.routes";
 import railwayRoutes from "./routes/railway.routes";
 import airportRoutes from "./routes/airport.routes";
 import flightRoutes from "./routes/flight.routes";
-import routeRoutes from "./routes/route.routes";
 import path from "path";
 import { ApiError } from "./errors/api.error";
 import { logger } from "./config/logger";
 
 const app=express();
+app.disable("x-powered-by");
+app.use(pinoHttp({ logger }));
 app.use(cors());
-//app.use(helmet());
-app.use(express.json());
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: "32kb" }));
 
 app.use(
     "/api/v1/collect",
@@ -29,7 +31,6 @@ app.use(
 app.use("/api/v1/railways", railwayRoutes );
 app.use("/api/v1/airports", airportRoutes);
 app.use("/api/v1/flights", flightRoutes);
-app.use("/api/routes", routeRoutes);
 
 app.use(
     (

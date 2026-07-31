@@ -2,6 +2,8 @@ export type JourneyStation = {
     id: string;
     code: string;
     name: string;
+    latitude?: number;
+    longitude?: number;
 };
 
 export type JourneyConnection = {
@@ -13,6 +15,7 @@ export type JourneyConnection = {
     sequence: number;
     departureMinute: number;
     arrivalMinute: number;
+    serviceDate?: string;
     boardingAllowed: boolean;
     alightingAllowed: boolean;
     fromDistanceKm: number | null;

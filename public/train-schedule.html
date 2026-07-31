@@ -24,6 +24,31 @@
             margin-bottom: 20px;
         }
 
+        .search-field {
+            display: inline-flex;
+            flex-direction: column;
+            min-width: 280px;
+            margin: 6px 10px 6px 0;
+            vertical-align: top;
+        }
+
+        .search-field label {
+            color: #374151;
+            font-size: 13px;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+
+        .coordinate-row {
+            display: flex;
+        }
+
+        .coordinate-row input {
+            width: 120px;
+            color: #6b7280;
+            background: #f8fafc;
+        }
+
         input,
         button {
             padding: 10px;
@@ -136,6 +161,45 @@
         .journey-table {
             padding: 0 20px 20px;
             overflow-x: auto;
+        }
+
+        .journey-section {
+            padding: 10px 20px;
+        }
+
+        .journey-section h3 {
+            margin: 5px 0 10px;
+            color: #374151;
+            font-size: 15px;
+        }
+
+        .journey-section ul {
+            margin: 0;
+            padding-left: 20px;
+            color: #4b5563;
+        }
+
+        .journey-badge {
+            display: inline-block;
+            margin-top: 4px;
+            padding: 4px 8px;
+            border-radius: 12px;
+            color: #075985;
+            background: #e0f2fe;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        .station-summary {
+            background: white;
+            border-radius: 10px;
+            padding: 16px 20px;
+            margin: 18px 0;
+        }
+
+        .recommended-label {
+            color: #047857;
+            font-weight: bold;
         }
 
         table {
@@ -259,22 +323,41 @@
     <h1> Railway Route Finder </h1>
     <div class="search-box">
 
-        <div class="autocomplete">
-            <label>From:</label>
-            <input id="departure" type="text" placeholder="Station Code or Name" autocomplete="off">
-            <ul id="departureSuggestions" class="suggestions"></ul>
+        <div class="search-field">
+            <label for="originLabel">Current location or station</label>
+            <div class="autocomplete">
+                <input id="originLabel" type="text"
+                    placeholder="Search DEHRADUN or DDN" autocomplete="off">
+                <ul id="originSuggestions" class="suggestions"></ul>
+            </div>
+            <div class="coordinate-row">
+                <input id="originLatitude" type="number" step="any"
+                    placeholder="Latitude" >
+                <input id="originLongitude" type="number" step="any"
+                    placeholder="Longitude" >
+            </div>
+            <button id="useLocationBtn" type="button">Use my current location</button>
         </div>
 
-
-        <div class="autocomplete">
-            <label>To:</label>
-            <input id="arrival" type="text" placeholder="Station Code or Name" autocomplete="off">
-            <ul id="arrivalSuggestions" class="suggestions"></ul>
+        <div class="search-field">
+            <label for="destinationLabel">Destination station or city</label>
+            <div class="autocomplete">
+                <input id="destinationLabel" type="text"
+                    placeholder="Search NEW DELHI or NDLS" autocomplete="off">
+                <ul id="destinationSuggestions" class="suggestions"></ul>
+            </div>
+            <div class="coordinate-row">
+                <input id="destinationLatitude" type="number" step="any"
+                    placeholder="Latitude" >
+                <input id="destinationLongitude" type="number" step="any"
+                    placeholder="Longitude" >
+            </div>
         </div>
 
-        <label>  Date: </label>
+        <br>
 
-        <input id="date" type="date">
+        <label>Departure date:</label>
+        <input id="departureDate" type="date">
 
         <button id="searchBtn" type="button">
             Search Route

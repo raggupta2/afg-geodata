@@ -13,6 +13,7 @@ type RailwayStationRow = {
     public_transport_type: string | null;
     internet_access: string | null;
     train_available: boolean;
+    active_train_count: number;
     distance_km: number | null;
     geometry: { type: "Point"; coordinates: [number, number] };
 };
@@ -61,7 +62,12 @@ export const getRailwayStations = async (
 
         const ordering = nearby
             ? Prisma.sql`distance_km, station_name, station_code NULLS LAST`
-            : Prisma.sql`${ranking} station_name, station_code NULLS LAST`;
+            : Prisma.sql`
+                ${ranking}
+                active_train_count DESC,
+                station_name,
+                station_code NULLS LAST
+            `;
 
         const rows = await prisma.$queryRaw<RailwayStationRow[]>(Prisma.sql`
             SELECT
@@ -74,6 +80,14 @@ export const getRailwayStations = async (
                 public_transport_type,
                 internet_access,
                 train_available,
+                (
+                    SELECT COUNT(DISTINCT stop.train_id)::INTEGER
+                    FROM train_stops stop
+                    JOIN "train" service
+                      ON service.id = stop.train_id
+                     AND service.active = TRUE
+                    WHERE stop.station_id = railway_station.id
+                ) AS active_train_count,
                 ${distance} AS distance_km,
                 ST_AsGeoJSON(geom)::json AS geometry
             FROM railway_station
@@ -99,6 +113,7 @@ export const getRailwayStations = async (
                     public_transport_type: row.public_transport_type,
                     internet_access: row.internet_access,
                     train_available: row.train_available,
+                    active_train_count: row.active_train_count,
                     distance_km: row.distance_km,
                     address: [row.station_name, row.network, row.operator]
                         .filter(Boolean)

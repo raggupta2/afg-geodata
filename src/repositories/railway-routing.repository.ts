@@ -1,8 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../config/database";
-import { JourneyConnection, JourneyStation } from "../types/railway-journey";
+import { JourneyConnection } from "../types/railway-journey";
 
-type StationRow = { id: bigint; code: string; name: string };
 type ConnectionRow = {
     id: bigint;
     trainId: bigint;
@@ -19,83 +18,53 @@ type ConnectionRow = {
     fromStationId: bigint;
     fromStationCode: string;
     fromStationName: string;
+    fromStationLatitude: number;
+    fromStationLongitude: number;
     toStationId: bigint;
     toStationCode: string;
     toStationName: string;
+    toStationLatitude: number;
+    toStationLongitude: number;
 };
 
-export type ResolvedJourneyStation = JourneyStation & { databaseId: bigint };
-
-export async function findJourneyStationByCode(
-    code: string
-): Promise<ResolvedJourneyStation | null> {
-    const rows = await prisma.$queryRaw<StationRow[]>(Prisma.sql`
-        SELECT
-            candidate.id,
-            candidate.station_code AS code,
-            candidate.station_name AS name
-        FROM railway_station requested
-        JOIN railway_station candidate
-          ON candidate.id = requested.id
-          OR (
-              NOT EXISTS (
-                  SELECT 1
-                  FROM train_stops requested_stop
-                  WHERE requested_stop.station_id = requested.id
-              )
-              AND ST_DWithin(candidate.geom, requested.geom, 0.0001)
-          )
-        WHERE requested.station_code = ${code}
-          AND candidate.station_code IS NOT NULL
-        ORDER BY
-            EXISTS (
-                SELECT 1
-                FROM train_stops candidate_stop
-                WHERE candidate_stop.station_id = candidate.id
-            ) DESC,
-            (candidate.id = requested.id) DESC,
-            candidate.train_available DESC
-        LIMIT 1
-    `);
-    const station = rows[0];
-    if (!station) return null;
-
+function mapConnectionRow(row: ConnectionRow): JourneyConnection {
     return {
-        id: station.id.toString(),
-        code: station.code,
-        name: station.name,
-        databaseId: station.id
+        id: row.id.toString(),
+        trainId: row.trainId.toString(),
+        trainNumber: row.trainNumber,
+        trainName: row.trainName,
+        runsMask: row.runsMask,
+        sequence: row.sequence,
+        departureMinute: row.departureMinute,
+        arrivalMinute: row.arrivalMinute,
+        boardingAllowed: row.boardingAllowed,
+        alightingAllowed: row.alightingAllowed,
+        fromDistanceKm: row.fromDistanceKm,
+        toDistanceKm: row.toDistanceKm,
+        fromStation: {
+            id: row.fromStationId.toString(),
+            code: row.fromStationCode,
+            name: row.fromStationName,
+            latitude: row.fromStationLatitude,
+            longitude: row.fromStationLongitude
+        },
+        toStation: {
+            id: row.toStationId.toString(),
+            code: row.toStationCode,
+            name: row.toStationName,
+            latitude: row.toStationLatitude,
+            longitude: row.toStationLongitude
+        }
     };
 }
 
-export async function findJourneyConnections(
-    departureStationId: bigint,
-    arrivalStationId: bigint
-): Promise<JourneyConnection[]> {
+/**
+ * Loads the immutable active timetable snapshot. This query is intentionally
+ * unfiltered: callers cache the result and reuse it across route searches
+ * instead of materializing most of the connected network for every request.
+ */
+export async function findAllActiveJourneyConnections(): Promise<JourneyConnection[]> {
     const rows = await prisma.$queryRaw<ConnectionRow[]>(Prisma.sql`
-        WITH RECURSIVE
-        forward_stations(station_id) AS (
-            SELECT ${departureStationId}::BIGINT
-            UNION
-            SELECT connection.to_station_id
-            FROM train_connections connection
-            JOIN forward_stations reachable
-              ON reachable.station_id = connection.from_station_id
-            JOIN "train" service
-              ON service.id = connection.train_id
-             AND service.active = TRUE
-        ),
-        backward_stations(station_id) AS (
-            SELECT ${arrivalStationId}::BIGINT
-            UNION
-            SELECT connection.from_station_id
-            FROM train_connections connection
-            JOIN backward_stations reachable
-              ON reachable.station_id = connection.to_station_id
-            JOIN "train" service
-              ON service.id = connection.train_id
-             AND service.active = TRUE
-        )
         SELECT
             connection.id,
             connection.train_id AS "trainId",
@@ -112,48 +81,25 @@ export async function findJourneyConnections(
             from_station.id AS "fromStationId",
             from_station.station_code AS "fromStationCode",
             from_station.station_name AS "fromStationName",
+            ST_Y(from_station.geom) AS "fromStationLatitude",
+            ST_X(from_station.geom) AS "fromStationLongitude",
             to_station.id AS "toStationId",
             to_station.station_code AS "toStationCode",
-            to_station.station_name AS "toStationName"
+            to_station.station_name AS "toStationName",
+            ST_Y(to_station.geom) AS "toStationLatitude",
+            ST_X(to_station.geom) AS "toStationLongitude"
         FROM train_connections connection
         JOIN "train" service
           ON service.id = connection.train_id
          AND service.active = TRUE
         JOIN train_stops from_stop ON from_stop.id = connection.from_stop_id
         JOIN train_stops to_stop ON to_stop.id = connection.to_stop_id
-        JOIN railway_station from_station ON from_station.id = connection.from_station_id
-        JOIN railway_station to_station ON to_station.id = connection.to_station_id
-        WHERE connection.from_station_id IN (SELECT station_id FROM forward_stations)
-          AND connection.to_station_id IN (SELECT station_id FROM backward_stations)
-        ORDER BY
-            connection.departure_minute,
-            connection.arrival_minute,
-            connection.train_id,
-            connection.sequence
+        JOIN railway_station from_station
+          ON from_station.id = connection.from_station_id
+        JOIN railway_station to_station
+          ON to_station.id = connection.to_station_id
+        ORDER BY connection.train_id, connection.sequence
     `);
 
-    return rows.map(row => ({
-        id: row.id.toString(),
-        trainId: row.trainId.toString(),
-        trainNumber: row.trainNumber,
-        trainName: row.trainName,
-        runsMask: row.runsMask,
-        sequence: row.sequence,
-        departureMinute: row.departureMinute,
-        arrivalMinute: row.arrivalMinute,
-        boardingAllowed: row.boardingAllowed,
-        alightingAllowed: row.alightingAllowed,
-        fromDistanceKm: row.fromDistanceKm,
-        toDistanceKm: row.toDistanceKm,
-        fromStation: {
-            id: row.fromStationId.toString(),
-            code: row.fromStationCode,
-            name: row.fromStationName
-        },
-        toStation: {
-            id: row.toStationId.toString(),
-            code: row.toStationCode,
-            name: row.toStationName
-        }
-    }));
+    return rows.map(mapConnectionRow);
 }
