@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Compare multimodal train, flight, and road journeys.">
+    <title>Journey Results | AFG Geodata</title>
+    <link rel="stylesheet" href="/leaflet/journey-results.css">
+</head>
+<body>
+    <a class="skip-link" href="#journeyResults">Skip to journey results</a>
+
+    <header class="site-header">
+        <a class="brand" href="/journey-results.html" aria-label="AFG Geodata journey search home">
+            <span class="brand-mark" aria-hidden="true">A</span>
+            <span>
+                <strong>AFG Geodata</strong>
+                <small>Journey planner</small>
+            </span>
+        </a>
+        <span class="header-label">Train · Flight · Road</span>
+    </header>
+
+    <main>
+        <section class="search-shell" aria-labelledby="searchTitle">
+            <div class="search-intro">
+                <p class="eyebrow">Plan door to door</p>
+                <h1 id="searchTitle">Find your best journey</h1>
+                <p>Compare complete routes across rail, air, and road transfers.</p>
+            </div>
+
+            <form id="journeySearchForm" class="search-form" novalidate>
+                <div class="location-fields">
+                    <div class="field autocomplete-field">
+                        <label for="originLabel">From</label>
+                        <div class="input-with-icon">
+                            <span class="field-icon origin-dot" aria-hidden="true"></span>
+                            <input id="originLabel" name="originLabel" type="search"
+                                placeholder="City or railway station" autocomplete="off"
+                                role="combobox" aria-autocomplete="list"
+                                aria-controls="originSuggestions" aria-expanded="false" required>
+                        </div>
+                        <ul id="originSuggestions" class="suggestions" role="listbox"></ul>
+                        <input id="originLatitude" type="hidden">
+                        <input id="originLongitude" type="hidden">
+                    </div>
+
+                    <button id="swapLocationsButton" class="swap-button" type="button"
+                        aria-label="Swap origin and destination" title="Swap locations">
+                        <span aria-hidden="true">⇄</span>
+                    </button>
+
+                    <div class="field autocomplete-field">
+                        <label for="destinationLabel">To</label>
+                        <div class="input-with-icon">
+                            <span class="field-icon destination-dot" aria-hidden="true"></span>
+                            <input id="destinationLabel" name="destinationLabel" type="search"
+                                placeholder="City or railway station" autocomplete="off"
+                                role="combobox" aria-autocomplete="list"
+                                aria-controls="destinationSuggestions" aria-expanded="false" required>
+                        </div>
+                        <ul id="destinationSuggestions" class="suggestions" role="listbox"></ul>
+                        <input id="destinationLatitude" type="hidden">
+                        <input id="destinationLongitude" type="hidden">
+                    </div>
+                </div>
+
+                <div class="field date-field">
+                    <label for="departureAt">Depart</label>
+                    <input id="departureAt" name="departureAt" type="date" required>
+                </div>
+
+                <button id="searchButton" class="primary-button" type="submit">
+                    <span class="button-label">Search journeys</span>
+                    <span class="button-spinner" aria-hidden="true"></span>
+                </button>
+
+                <button id="useLocationButton" class="location-button" type="button">
+                    <span aria-hidden="true">⌖</span> Use my location
+                </button>
+            </form>
+            <p id="formError" class="form-error" role="alert" hidden></p>
+        </section>
+
+        <div id="resultsWorkspace" class="results-workspace" hidden>
+            <aside id="filterPanel" class="filter-panel" aria-labelledby="filterTitle">
+                <div class="filter-heading">
+                    <div>
+                        <p class="eyebrow">Refine results</p>
+                        <h2 id="filterTitle">Filters</h2>
+                    </div>
+                    <button id="closeFiltersButton" class="icon-button mobile-only" type="button"
+                        aria-label="Close filters">×</button>
+                </div>
+
+                <div class="filter-section">
+                    <h3>Recommended</h3>
+                    <div class="quick-filter-grid">
+                        <button class="quick-filter" type="button" data-quick-filter="fastest"
+                            aria-pressed="false">Fastest</button>
+                        <button class="quick-filter" type="button" data-quick-filter="fewest"
+                            aria-pressed="false">Fewest transfers</button>
+                    </div>
+                </div>
+
+                <fieldset class="filter-section">
+                    <legend>Journey type</legend>
+                    <label class="check-row">
+                        <input type="checkbox" name="journeyType" value="RAIL_ONLY">
+                        <span>Train only</span>
+                    </label>
+                    <label class="check-row">
+                        <input type="checkbox" name="journeyType" value="FLIGHT_ONLY">
+                        <span>Flight only</span>
+                    </label>
+                    <label class="check-row">
+                        <input type="checkbox" name="journeyType" value="RAIL_TO_FLIGHT">
+                        <span>Train → Flight</span>
+                    </label>
+                    <label class="check-row">
+                        <input type="checkbox" name="journeyType" value="FLIGHT_TO_RAIL">
+                        <span>Flight → Train</span>
+                    </label>
+                </fieldset>
+
+                <div class="filter-section">
+                    <div class="range-heading">
+                        <label for="maximumTransfers">Maximum transfers</label>
+                        <output id="maximumTransfersValue" for="maximumTransfers">Any</output>
+                    </div>
+                    <input id="maximumTransfers" class="range-input" type="range" min="0" max="6" value="6">
+                </div>
+
+                <fieldset class="filter-section time-filter">
+                    <legend>Departure time</legend>
+                    <div class="time-grid">
+                        <label>After <input id="departureAfter" type="time"></label>
+                        <label>Before <input id="departureBefore" type="time"></label>
+                    </div>
+                </fieldset>
+
+                <fieldset class="filter-section time-filter">
+                    <legend>Arrival time</legend>
+                    <div class="time-grid">
+                        <label>After <input id="arrivalAfter" type="time"></label>
+                        <label>Before <input id="arrivalBefore" type="time"></label>
+                    </div>
+                </fieldset>
+
+                <fieldset id="airlineFilterSection" class="filter-section" hidden>
+                    <legend>Airlines</legend>
+                    <div id="airlineFilters" class="airline-list"></div>
+                </fieldset>
+
+                <button id="clearFiltersButton" class="secondary-button full-width" type="button">
+                    Clear all filters
+                </button>
+            </aside>
+
+            <div id="filterBackdrop" class="filter-backdrop" hidden></div>
+
+            <section class="results-column" aria-labelledby="resultsTitle">
+                <div class="results-toolbar">
+                    <div>
+                        <p id="routeContext" class="route-context"></p>
+                        <h2 id="resultsTitle">Journey results</h2>
+                        <p id="resultCount" class="result-count" aria-live="polite"></p>
+                    </div>
+                    <div class="toolbar-actions">
+                        <button id="openFiltersButton" class="secondary-button mobile-only" type="button"
+                            aria-controls="filterPanel" aria-expanded="false">Filters</button>
+                        <label class="sort-control" for="sortBy">
+                            <span>Sort by</span>
+                            <select id="sortBy">
+                                <option value="duration">Total journey duration</option>
+                                <option value="departure">Departure time</option>
+                                <option value="arrival">Arrival time</option>
+                                <option value="transfers">Number of transfers</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
+
+                <div id="activeFilters" class="active-filters" aria-label="Active filters"></div>
+                <div id="journeyResults" class="journey-results" aria-busy="false"></div>
+                <button id="showMoreButton" class="secondary-button show-more" type="button" hidden>
+                    Show more journeys
+                </button>
+            </section>
+        </div>
+
+        <section id="initialState" class="state-card welcome-state">
+            <div class="state-icon" aria-hidden="true">↗</div>
+            <h2>Your complete trip, in one view</h2>
+            <p>Search above to compare train, flight, and road connections from your starting point to your destination.</p>
+        </section>
+
+        <section id="loadingState" class="loading-state" aria-label="Searching for journeys" hidden>
+            <div class="loading-heading">
+                <span class="large-spinner" aria-hidden="true"></span>
+                <div>
+                    <h2>Building your best routes</h2>
+                    <p>Checking train, flight, and transfer connections…</p>
+                </div>
+            </div>
+            <div class="skeleton-card"></div>
+            <div class="skeleton-card short"></div>
+        </section>
+
+        <section id="errorState" class="state-card error-state" role="alert" hidden>
+            <div class="state-icon" aria-hidden="true">!</div>
+            <h2>We couldn’t load journeys</h2>
+            <p id="errorMessage">Please check your connection and try again.</p>
+            <button id="retryButton" class="primary-button compact" type="button">Try again</button>
+        </section>
+
+        <section id="emptyState" class="state-card" hidden>
+            <div class="state-icon" aria-hidden="true">⌁</div>
+            <h2 id="emptyTitle">No journeys found</h2>
+            <p id="emptyMessage">Try a different departure time or broaden your search.</p>
+            <button id="emptyActionButton" class="secondary-button" type="button">Clear filters</button>
+        </section>
+    </main>
+
+    <template id="journeyCardTemplate">
+        <article class="journey-card">
+            <button class="journey-summary" type="button" aria-expanded="false">
+                <span class="summary-main"></span>
+                <span class="expand-label">View details <span class="chevron" aria-hidden="true">⌄</span></span>
+            </button>
+            <div class="journey-details" hidden></div>
+        </article>
+    </template>
+
+    <script src="/config.js"></script>
+    <script src="/leaflet/journey-results.js"></script>
+</body>
+</html>

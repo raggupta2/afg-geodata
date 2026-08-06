@@ -209,6 +209,8 @@ export type JourneySearchResult = {
         roadDistanceAccuracy: "ESTIMATED";
         detourFactor: number;
         averageRoadSpeedKph: number;
+        shortDistanceRoadSpeedKph: number;
+        roadDistanceSpeedThresholdKm: number;
         boardingBufferMinutes: number;
         minimumRailTransferMinutes: number;
         maximumTrainLegs: number;

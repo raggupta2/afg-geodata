@@ -9,7 +9,9 @@
     "start": "node dist/server.js",
     "test:railway-search": "npm run build && node --test --test-concurrency=1 tests/railway-search.test.js",
     "test:railway-routes": "npm run test:railway-search",
+    "test:multimodal-search": "npm run build && node --test --test-concurrency=1 tests/multimodal-search.test.js",
     "data:import-trains": "python scripts/import_train_timetables.py",
+    "data:import-aviation": "npm run build && node dist/maintenance/import-aviation-edge.js",
     "prisma": "prisma"
   },
   "keywords": [],

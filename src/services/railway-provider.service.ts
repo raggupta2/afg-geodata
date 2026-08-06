@@ -1,3 +1,4 @@
+import { JourneyRoutingPolicy } from "@prisma/client";
 import { ApiError } from "../errors/api.error";
 import { BoundedAsyncTtlCache } from "../cache/bounded-async-ttl-cache";
 import { findAllActiveJourneyConnections } from "../repositories/railway-routing.repository";
@@ -58,26 +59,33 @@ export type RailwayProviderResult = {
     truncationReason: string | null;
 };
 
+export type RailwayRideExpansion = {
+    trainId: string;
+    departureMinute: number;
+    arrivalMinute: number;
+    destinationStationId: string;
+    connections: JourneyConnection[];
+};
+
 type SearchLimits = {
     maxResults: number;
     latestOriginDepartureMinute?: number;
 };
 
+export type RailwayRoutingLimits = {
+    minimumRailTransferMinutes: number;
+    maxTrainLegs: number;
+    searchHorizonDays: number;
+};
+
 const MINUTES_PER_DAY = 24 * 60;
-const configuredMaximumTrainLegs = Number(
-    process.env.RAILWAY_MAX_TRAIN_LEGS ?? 4
-);
-const MAX_TRAIN_LEGS = Number.isInteger(configuredMaximumTrainLegs)
-    ? Math.min(Math.max(configuredMaximumTrainLegs, 1), 6)
-    : 4;
-const MAX_SEARCH_DAYS = 3;
-export const MAXIMUM_TRAIN_LEGS = MAX_TRAIN_LEGS;
-export const RAILWAY_SEARCH_HORIZON_DAYS = MAX_SEARCH_DAYS;
+// Hard engine ceiling, independent of policy: guards against pathological
+// configuration values triggering runaway state-space growth.
+const ENGINE_MAX_SUPPORTED_TRAIN_LEGS = 6;
 const MAX_EXPANDED_STATES = 30_000;
 const MAX_GENERATED_STATES = 200_000;
 const MAX_STATES_PER_STATION_DEPTH = 3;
 const MAX_MINIMUM_LEG_CACHE_ENTRIES = 128;
-export const MINIMUM_RAIL_TRANSFER_MINUTES = 10;
 const SNAPSHOT_TTL_MS = Number(
     process.env.RAILWAY_GRAPH_TTL_MS ?? 30 * 60 * 1000
 );
@@ -93,6 +101,19 @@ const WEEKDAYS: RailwayOperatingDay[] = [
     "friday",
     "saturday"
 ];
+
+export function resolveRailwayRoutingLimits(
+    policy: JourneyRoutingPolicy
+): RailwayRoutingLimits {
+    return {
+        minimumRailTransferMinutes: policy.railToRailMinutes,
+        maxTrainLegs: Math.min(
+            policy.maximumTransfers + 1,
+            ENGINE_MAX_SUPPORTED_TRAIN_LEGS
+        ),
+        searchHorizonDays: policy.searchHorizonDays
+    };
+}
 
 let graphSnapshot: RailwayGraphSnapshot | null = null;
 let graphLoadPromise: Promise<RailwayGraphSnapshot> | null = null;
@@ -211,7 +232,8 @@ async function getGraphSnapshot(): Promise<RailwayGraphSnapshot> {
 function findNextTrainOccurrence(
     boarding: TrainBoarding,
     earliestDepartureMinute: number,
-    requestedDate: Date
+    requestedDate: Date,
+    maxSearchDays: number
 ): JourneyConnection[] | null {
     const first = boarding.connections[boarding.startIndex];
     const originDayOffset = Math.floor(
@@ -229,7 +251,7 @@ function findNextTrainOccurrence(
         departureDay += 1;
     }
 
-    while (departureDay <= MAX_SEARCH_DAYS) {
+    while (departureDay <= maxSearchDays) {
         const trainOriginDate = addDays(
             requestedDate,
             departureDay - originDayOffset
@@ -270,7 +292,8 @@ function findNextTrainOccurrence(
 
 function findMinimumRemainingLegs(
     snapshot: RailwayGraphSnapshot,
-    destinationStationIds: Set<string>
+    destinationStationIds: Set<string>,
+    maxTrainLegs: number
 ): Map<string, number> {
     const cacheKey = [...destinationStationIds].sort().join("|");
     const cached = snapshot.minimumLegsCache.get(cacheKey);
@@ -290,7 +313,7 @@ function findMinimumRemainingLegs(
     const minimumLegs = new Map<string, number>(
         [...destinationStationIds].map(stationId => [stationId, 0])
     );
-    for (let iteration = 0; iteration < MAX_TRAIN_LEGS; iteration += 1) {
+    for (let iteration = 0; iteration < maxTrainLegs; iteration += 1) {
         let changed = false;
         for (const trainConnections of byTrain.values()) {
             let bestDownstreamLegs: number | undefined;
@@ -493,7 +516,8 @@ async function searchEarliestPaths(
     maxResults: number,
     maxResultsPerOrigin: number,
     resultKeys: Set<string>,
-    trainKeys: Set<string>
+    trainKeys: Set<string>,
+    limits: RailwayRoutingLimits
 ): Promise<{
     paths: RailwayPath[];
     truncated: boolean;
@@ -504,7 +528,7 @@ async function searchEarliestPaths(
     const reachableOriginIds = new Set<string>();
     for (const origin of origins) {
         const minimumLegs = minimumRemainingLegs.get(origin.stationId);
-        if (minimumLegs === undefined || minimumLegs > MAX_TRAIN_LEGS) {
+        if (minimumLegs === undefined || minimumLegs > limits.maxTrainLegs) {
             continue;
         }
         reachableOriginIds.add(origin.stationId);
@@ -573,7 +597,7 @@ async function searchEarliestPaths(
             }
             continue;
         }
-        if (state.rides.length >= MAX_TRAIN_LEGS) continue;
+        if (state.rides.length >= limits.maxTrainLegs) continue;
         if (
             (resultsByOrigin.get(state.originStationId) ?? 0)
             >= maxResultsPerOrigin
@@ -587,14 +611,15 @@ async function searchEarliestPaths(
         }
 
         const earliestDeparture = state.arrivalMinute
-            + (state.rides.length > 0 ? MINIMUM_RAIL_TRANSFER_MINUTES : 0);
+            + (state.rides.length > 0 ? limits.minimumRailTransferMinutes : 0);
         const boardings = snapshot.boardingsByStation.get(state.stationId) ?? [];
         for (const boarding of boardings) {
             if (state.usedTrainIds.has(boarding.trainId)) continue;
             const occurrence = findNextTrainOccurrence(
                 boarding,
                 earliestDeparture,
-                requestedDate
+                requestedDate,
+                limits.searchHorizonDays
             );
             if (!occurrence) continue;
 
@@ -609,7 +634,7 @@ async function searchEarliestPaths(
                 );
                 if (remaining === undefined) continue;
                 const nextLegCount = state.rides.length + 1;
-                if (nextLegCount + remaining > MAX_TRAIN_LEGS) continue;
+                if (nextLegCount + remaining > limits.maxTrainLegs) continue;
 
                 const nextState: JourneySearchState = {
                     originStationId: state.originStationId,
@@ -643,6 +668,7 @@ async function searchRoundBasedPaths(
     origins: RailwaySearchOrigin[],
     destinationStationIds: Set<string>,
     requestedDate: Date,
+    limits: RailwayRoutingLimits,
     latestOriginDepartureMinute?: number
 ): Promise<RailwayPath[]> {
     const paths: RailwayPath[] = [];
@@ -665,7 +691,7 @@ async function searchRoundBasedPaths(
 
         for (
             let round = 1;
-            round <= MAX_TRAIN_LEGS && previousRound.size > 0;
+            round <= limits.maxTrainLegs && previousRound.size > 0;
             round += 1
         ) {
             const nextRound = new Map<string, RoundLabel>();
@@ -679,7 +705,7 @@ async function searchRoundBasedPaths(
                     );
                 }
                 const earliestDeparture = label.arrivalMinute
-                    + (round > 1 ? MINIMUM_RAIL_TRANSFER_MINUTES : 0);
+                    + (round > 1 ? limits.minimumRailTransferMinutes : 0);
                 const boardings = snapshot.boardingsByStation.get(
                     label.stationId
                 ) ?? [];
@@ -689,7 +715,8 @@ async function searchRoundBasedPaths(
                     const occurrence = findNextTrainOccurrence(
                         boarding,
                         earliestDeparture,
-                        requestedDate
+                        requestedDate,
+                        limits.searchHorizonDays
                     );
                     if (!occurrence) continue;
                     if (
@@ -780,6 +807,7 @@ function findDirectPaths(
     destinationStationIds: Set<string>,
     requestedDate: Date,
     maxResultsPerOrigin: number,
+    searchHorizonDays: number,
     latestOriginDepartureMinute?: number
 ): {
     paths: RailwayPath[];
@@ -797,7 +825,8 @@ function findDirectPaths(
             const occurrence = findNextTrainOccurrence(
                 boarding,
                 origin.readyMinute,
-                requestedDate
+                requestedDate,
+                searchHorizonDays
             );
             if (!occurrence) continue;
             if (
@@ -867,7 +896,8 @@ async function executeSearch(
     origins: RailwaySearchOrigin[],
     destinationStationIds: Set<string>,
     requestedDate: Date,
-    limits: SearchLimits
+    limits: SearchLimits,
+    routingLimits: RailwayRoutingLimits
 ): Promise<RailwayProviderResult> {
     const snapshot = await getGraphSnapshot();
     const maxResultsPerOrigin = Math.max(
@@ -880,6 +910,7 @@ async function executeSearch(
         destinationStationIds,
         requestedDate,
         maxResultsPerOrigin,
+        routingLimits.searchHorizonDays,
         limits.latestOriginDepartureMinute
     );
     const paths: RailwayPath[] = [...direct.paths];
@@ -888,6 +919,7 @@ async function executeSearch(
         origins,
         destinationStationIds,
         requestedDate,
+        routingLimits,
         limits.latestOriginDepartureMinute
     );
     paths.push(...roundBasedPaths);
@@ -974,6 +1006,7 @@ export async function searchRailwayProvider(
     destinationStationIds: Set<string>,
     requestedDate: Date,
     maxResults: number,
+    routingLimits: RailwayRoutingLimits,
     latestOriginDepartureMinute?: number
 ): Promise<RailwayProviderResult> {
     if (origins.length === 0 || destinationStationIds.size === 0) {
@@ -994,7 +1027,10 @@ export async function searchRailwayProvider(
             .join(","),
         [...destinationStationIds].sort().join(","),
         maxResults,
-        latestOriginDepartureMinute ?? "none"
+        latestOriginDepartureMinute ?? "none",
+        routingLimits.minimumRailTransferMinutes,
+        routingLimits.maxTrainLegs,
+        routingLimits.searchHorizonDays
     ].join("|");
     return providerResultCache.getOrLoad(
         cacheKey,
@@ -1003,10 +1039,62 @@ export async function searchRailwayProvider(
                 origins,
                 destinationStationIds,
                 requestedDate,
-                { maxResults, latestOriginDepartureMinute }
+                { maxResults, latestOriginDepartureMinute },
+                routingLimits
             )
         )
     );
+}
+
+export async function expandRailwayRides(
+    stationId: string,
+    earliestDepartureMinute: number,
+    requestedDate: Date,
+    excludedTrainIds: Set<string>,
+    searchHorizonDays: number,
+    maximumOptions = 400
+): Promise<RailwayRideExpansion[]> {
+    const snapshot = await getGraphSnapshot();
+    const boardings = snapshot.boardingsByStation.get(stationId) ?? [];
+    const options: RailwayRideExpansion[] = [];
+
+    for (const boarding of boardings) {
+        if (excludedTrainIds.has(boarding.trainId)) continue;
+        const occurrence = findNextTrainOccurrence(
+            boarding,
+            earliestDepartureMinute,
+            requestedDate,
+            searchHorizonDays
+        );
+        if (!occurrence) continue;
+        const ride: JourneyConnection[] = [];
+        for (const connection of occurrence) {
+            ride.push(connection);
+            if (!connection.alightingAllowed) continue;
+            options.push({
+                trainId: boarding.trainId,
+                departureMinute: ride[0].departureMinute,
+                arrivalMinute: connection.arrivalMinute,
+                destinationStationId: connection.toStation.id,
+                connections: [...ride]
+            });
+        }
+    }
+
+    options.sort((left, right) =>
+        left.departureMinute - right.departureMinute
+        || left.arrivalMinute - right.arrivalMinute
+    );
+    const selected: RailwayRideExpansion[] = [];
+    const destinationCounts = new Map<string, number>();
+    for (const option of options) {
+        const count = destinationCounts.get(option.destinationStationId) ?? 0;
+        if (count >= 3) continue;
+        destinationCounts.set(option.destinationStationId, count + 1);
+        selected.push(option);
+        if (selected.length >= maximumOptions) break;
+    }
+    return selected;
 }
 
 export function stationFromConnection(

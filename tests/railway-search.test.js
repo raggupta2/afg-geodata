@@ -5,13 +5,20 @@ const { after, before, test } = require("node:test");
 const app = require("../dist/app").default;
 const { prisma } = require("../dist/config/database");
 const {
-    calculateStationAccess,
-    AVERAGE_ROAD_SPEED_KPH,
-    ROAD_DISTANCE_DETOUR_FACTOR
+    calculateStationAccess
 } = require("../dist/services/station-access.service");
 const {
     parseJourneySearch
 } = require("../dist/validators/journey-search.validator");
+
+async function loadActiveRoutingPolicy() {
+    const policy = await prisma.journeyRoutingPolicy.findFirst({
+        where: { active: true },
+        orderBy: { version: "desc" }
+    });
+    assert.ok(policy, "Expected an active journey routing policy to be seeded.");
+    return policy;
+}
 
 let server;
 let baseUrl;
@@ -78,21 +85,77 @@ test("journey search accepts a date without inventing a departure time", () => {
     assert.equal(result.departureAt, undefined);
 });
 
-test("station access keeps aerial and estimated road distance separate", () => {
-    const access = calculateStationAccess(100);
+test("station access keeps aerial and estimated road distance separate", async () => {
+    const policy = await loadActiveRoutingPolicy();
+    const access = calculateStationAccess(100, policy);
     assert.equal(access.aerialDistanceKm, 100);
     assert.equal(
         access.estimatedRoadDistanceKm,
-        100 * ROAD_DISTANCE_DETOUR_FACTOR
+        100 * Number(policy.roadDetourFactor)
     );
     assert.equal(
         access.travelMinutes,
         Math.ceil(
             access.estimatedRoadDistanceKm
-            / AVERAGE_ROAD_SPEED_KPH
+            / Number(policy.longDistanceRoadSpeedKph)
             * 60
         )
     );
+});
+
+test("station access applies the short-distance road speed below the configured threshold", async () => {
+    const policy = await loadActiveRoutingPolicy();
+    const thresholdKm = Number(policy.roadSpeedDistanceThresholdKm);
+    const detourFactor = Number(policy.roadDetourFactor);
+    const shortAerialDistanceKm = (thresholdKm / detourFactor) / 2;
+
+    const access = calculateStationAccess(shortAerialDistanceKm, policy);
+    assert.ok(access.estimatedRoadDistanceKm <= thresholdKm);
+    assert.equal(
+        access.travelMinutes,
+        Math.ceil(
+            access.estimatedRoadDistanceKm
+            / Number(policy.roadSpeedKph)
+            * 60
+        )
+    );
+});
+
+test("station access has no hardcoded configuration left in the service module", () => {
+    const stationAccessService = require("../dist/services/station-access.service");
+    assert.equal(stationAccessService.AVERAGE_ROAD_SPEED_KPH, undefined);
+    assert.equal(stationAccessService.ROAD_DISTANCE_DETOUR_FACTOR, undefined);
+    assert.equal(stationAccessService.BOARDING_BUFFER_MINUTES, undefined);
+});
+
+test("journey routing policy changes in the database are reflected without a redeploy", async () => {
+    const policy = await loadActiveRoutingPolicy();
+    const originalLongDistanceSpeed = policy.longDistanceRoadSpeedKph;
+    const changedSpeed = Number(originalLongDistanceSpeed) + 15;
+
+    try {
+        await prisma.journeyRoutingPolicy.update({
+            where: { id: policy.id },
+            data: { longDistanceRoadSpeedKph: changedSpeed }
+        });
+
+        const response = await fetch(`${baseUrl}/api/v1/railways/search`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                ...requestBody,
+                departureAt: "2026-07-31T08:07:00+05:30"
+            })
+        });
+        const body = await response.json();
+        assert.equal(response.status, 200);
+        assert.equal(body.data.assumptions.averageRoadSpeedKph, changedSpeed);
+    } finally {
+        await prisma.journeyRoutingPolicy.update({
+            where: { id: policy.id },
+            data: { longDistanceRoadSpeedKph: originalLongDistanceSpeed }
+        });
+    }
 });
 
 test("old railway search endpoints are removed", async () => {
@@ -173,15 +236,15 @@ test("coordinate search returns ranked nearby-station journeys", async () => {
         new Set(body.data.trainResults.map(option => option.itineraryKey)).size,
         body.data.trainResults.length
     );
-    const firstTransferIndex = body.data.trainResults.findIndex(
-        option => option.journeyType === "TRANSFER"
-    );
-    assert.ok(
-        firstTransferIndex === -1
-        || body.data.trainResults
-            .slice(0, firstTransferIndex)
-            .every(option => option.journeyType === "DIRECT")
-    );
+    for (let index = 1; index < body.data.trainResults.length; index += 1) {
+        assert.ok(
+            body.data.trainResults[index - 1].totalJourneyMinutes
+                <= body.data.trainResults[index].totalJourneyMinutes
+        );
+    }
+    assert.ok(body.data.trainResults.every(
+        option => option.overallScoreMinutes === option.totalJourneyMinutes
+    ));
 });
 
 test("date-only search includes the direct HW to LMNR train", async () => {

@@ -1,6 +1,4 @@
-export const AVERAGE_ROAD_SPEED_KPH = 30;
-export const ROAD_DISTANCE_DETOUR_FACTOR = 1.5;
-export const BOARDING_BUFFER_MINUTES = 30;
+import { JourneyRoutingPolicy } from "@prisma/client";
 
 export type AccessCalculation = {
     aerialDistanceKm: number;
@@ -9,13 +7,19 @@ export type AccessCalculation = {
 };
 
 export function calculateStationAccess(
-    aerialDistanceKm: number
+    aerialDistanceKm: number,
+    policy: JourneyRoutingPolicy
 ): AccessCalculation {
-    const estimatedRoadDistanceKm = (
-        aerialDistanceKm * ROAD_DISTANCE_DETOUR_FACTOR
+    const roadDetourFactor = Number(policy.roadDetourFactor);
+    const roadSpeedDistanceThresholdKm = Number(
+        policy.roadSpeedDistanceThresholdKm
     );
+    const estimatedRoadDistanceKm = aerialDistanceKm * roadDetourFactor;
+    const roadSpeedKph = estimatedRoadDistanceKm > roadSpeedDistanceThresholdKm
+        ? Number(policy.longDistanceRoadSpeedKph)
+        : Number(policy.roadSpeedKph);
     const travelMinutes = Math.ceil(
-        estimatedRoadDistanceKm / AVERAGE_ROAD_SPEED_KPH * 60
+        estimatedRoadDistanceKm / roadSpeedKph * 60
     );
 
     return {

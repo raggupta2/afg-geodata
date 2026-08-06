@@ -120,6 +120,7 @@ model RailwayStation {
   trainStops                TrainStop[]
   sourceTrainEndpoints      TrainEndpoint[]         @relation("TrainEndpointSourceStation")
   destinationTrainEndpoints TrainEndpoint[]         @relation("TrainEndpointDestinationStation")
+  transportHubMapping       RailwayStationHub?
 
   @@map("railway_station")
 }
@@ -226,4 +227,209 @@ model TrainScheduleImport {
   @@index([checksum])
   @@index([trainNumber])
   @@map("train_schedule_imports")
+}
+
+model TransportCity {
+  id             BigInt                    @id @default(autoincrement())
+  providerCityId BigInt?                   @unique @map("provider_city_id")
+  iataCode       String                    @unique @map("iata_code") @db.VarChar(3)
+  name           String                    @db.VarChar(150)
+  countryCode    String                    @default("IN") @map("country_code") @db.Char(2)
+  latitude       Decimal                   @db.Decimal(10, 7)
+  longitude      Decimal                   @db.Decimal(10, 7)
+  timezone       String                    @default("Asia/Kolkata") @db.VarChar(100)
+  geom           Unsupported("geography")?
+  createdAt      DateTime                  @default(now()) @map("created_at")
+  updatedAt      DateTime                  @default(now()) @updatedAt @map("updated_at")
+  hubs           TransportHub[]
+
+  @@index([geom], map: "transport_cities_geom_idx", type: Gist)
+  @@map("transport_cities")
+}
+
+model TransportHub {
+  id                    BigInt                    @id @default(autoincrement())
+  cityId                BigInt?                   @map("city_id")
+  hubType               String                    @map("hub_type") @db.VarChar(20)
+  code                  String                    @db.VarChar(20)
+  name                  String                    @db.VarChar(200)
+  latitude              Decimal                   @db.Decimal(10, 7)
+  longitude             Decimal                   @db.Decimal(10, 7)
+  timezone              String                    @default("Asia/Kolkata") @db.VarChar(100)
+  geom                  Unsupported("geography")?
+  active                Boolean                   @default(true)
+  createdAt             DateTime                  @default(now()) @map("created_at")
+  updatedAt             DateTime                  @default(now()) @updatedAt @map("updated_at")
+  city                  TransportCity?            @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  railwayStationMapping RailwayStationHub?
+  airport               AviationAirport?
+  outgoingTransferLinks HubTransferLink[]         @relation("HubTransferFrom")
+  incomingTransferLinks HubTransferLink[]         @relation("HubTransferTo")
+
+  @@unique([hubType, code], map: "transport_hubs_type_code_key")
+  @@index([cityId, hubType, active], map: "transport_hubs_city_type_active_idx")
+  @@index([geom], map: "transport_hubs_geom_idx", type: Gist)
+  @@map("transport_hubs")
+}
+
+model RailwayStationHub {
+  stationId     BigInt         @id @map("station_id")
+  hubId         BigInt         @unique @map("hub_id")
+  mappingMethod String         @default("RAILWAY_BACKFILL") @map("mapping_method") @db.VarChar(40)
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @default(now()) @updatedAt @map("updated_at")
+  station       RailwayStation @relation(fields: [stationId], references: [id], onDelete: Cascade)
+  hub           TransportHub   @relation(fields: [hubId], references: [id], onDelete: Cascade)
+
+  @@map("railway_station_hubs")
+}
+
+model AviationAirport {
+  id                BigInt                     @id @default(autoincrement())
+  providerAirportId BigInt                     @unique @map("provider_airport_id")
+  hubId             BigInt                     @unique @map("hub_id")
+  iataCode          String                     @unique @map("iata_code") @db.VarChar(3)
+  icaoCode          String?                    @map("icao_code") @db.VarChar(4)
+  cityIataCode      String?                    @map("city_iata_code") @db.VarChar(3)
+  countryCode       String                     @default("IN") @map("country_code") @db.Char(2)
+  geonameId         BigInt?                    @map("geoname_id")
+  createdAt         DateTime                   @default(now()) @map("created_at")
+  updatedAt         DateTime                   @default(now()) @updatedAt @map("updated_at")
+  hub               TransportHub               @relation(fields: [hubId], references: [id], onDelete: Cascade)
+  departingFlights  AviationFlightInstance[]   @relation("FlightDepartureAirport")
+  arrivingFlights   AviationFlightInstance[]   @relation("FlightArrivalAirport")
+  coverage          AviationScheduleCoverage[]
+
+  @@index([countryCode, iataCode], map: "aviation_airports_country_iata_idx")
+  @@map("aviation_airports")
+}
+
+model AviationAirline {
+  id                BigInt                   @id @default(autoincrement())
+  providerAirlineId BigInt                   @unique @map("provider_airline_id")
+  iataCode          String?                  @map("iata_code") @db.VarChar(3)
+  icaoCode          String?                  @map("icao_code") @db.VarChar(4)
+  name              String                   @db.VarChar(200)
+  callsign          String?                  @db.VarChar(100)
+  countryCode       String                   @default("IN") @map("country_code") @db.Char(2)
+  providerStatus    String?                  @map("provider_status") @db.VarChar(30)
+  serviceType       String?                  @map("service_type") @db.VarChar(30)
+  createdAt         DateTime                 @default(now()) @map("created_at")
+  updatedAt         DateTime                 @default(now()) @updatedAt @map("updated_at")
+  flights           AviationFlightInstance[]
+
+  @@index([iataCode], map: "aviation_airlines_iata_idx")
+  @@index([icaoCode], map: "aviation_airlines_icao_idx")
+  @@map("aviation_airlines")
+}
+
+model AviationScheduleImport {
+  id                 BigInt   @id @default(autoincrement())
+  sourceFile         String   @map("source_file")
+  checksum           String   @db.Char(64)
+  sourceAirportCode  String   @map("source_airport_code") @db.VarChar(3)
+  serviceDate        DateTime @map("service_date") @db.Date
+  status             String   @db.VarChar(30)
+  totalRows          Int      @default(0) @map("total_rows")
+  acceptedRows       Int      @default(0) @map("accepted_rows")
+  codeshareRows      Int      @default(0) @map("codeshare_rows")
+  internationalRows  Int      @default(0) @map("international_rows")
+  unknownAirportRows Int      @default(0) @map("unknown_airport_rows")
+  invalidRows        Int      @default(0) @map("invalid_rows")
+  importedAt         DateTime @default(now()) @map("imported_at")
+
+  @@unique([sourceAirportCode, serviceDate, checksum], map: "aviation_schedule_imports_file_key")
+  @@index([serviceDate, status], map: "aviation_schedule_imports_date_status_idx")
+  @@map("aviation_schedule_imports")
+}
+
+model AviationScheduleCoverage {
+  id          BigInt          @id @default(autoincrement())
+  airportId   BigInt          @map("airport_id")
+  serviceDate DateTime        @map("service_date") @db.Date
+  status      String          @db.VarChar(30)
+  detail      String?
+  updatedAt   DateTime        @default(now()) @updatedAt @map("updated_at")
+  airport     AviationAirport @relation(fields: [airportId], references: [id], onDelete: Cascade)
+
+  @@unique([airportId, serviceDate], map: "aviation_schedule_coverage_airport_date_key")
+  @@index([serviceDate, status], map: "aviation_schedule_coverage_date_status_idx")
+  @@map("aviation_schedule_coverage")
+}
+
+model AviationFlightInstance {
+  id                 BigInt           @id @default(autoincrement())
+  identityKey        String           @unique @map("identity_key") @db.VarChar(160)
+  airlineId          BigInt?          @map("airline_id")
+  departureAirportId BigInt           @map("departure_airport_id")
+  arrivalAirportId   BigInt           @map("arrival_airport_id")
+  serviceDate        DateTime         @map("service_date") @db.Date
+  airlineIataCode    String?          @map("airline_iata_code") @db.VarChar(3)
+  airlineIcaoCode    String?          @map("airline_icao_code") @db.VarChar(4)
+  flightNumber       String           @map("flight_number") @db.VarChar(16)
+  flightIataNumber   String?          @map("flight_iata_number") @db.VarChar(16)
+  flightIcaoNumber   String?          @map("flight_icao_number") @db.VarChar(20)
+  departureAt        DateTime         @map("departure_at") @db.Timestamptz(6)
+  arrivalAt          DateTime         @map("arrival_at") @db.Timestamptz(6)
+  departureTerminal  String?          @map("departure_terminal") @db.VarChar(10)
+  arrivalTerminal    String?          @map("arrival_terminal") @db.VarChar(10)
+  departureGate      String?          @map("departure_gate") @db.VarChar(10)
+  arrivalGate        String?          @map("arrival_gate") @db.VarChar(10)
+  aircraftModelCode  String?          @map("aircraft_model_code") @db.VarChar(20)
+  aircraftModelText  String?          @map("aircraft_model_text") @db.VarChar(100)
+  status             String?          @db.VarChar(30)
+  active             Boolean          @default(true)
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @default(now()) @updatedAt @map("updated_at")
+  airline            AviationAirline? @relation(fields: [airlineId], references: [id], onDelete: SetNull)
+  departureAirport   AviationAirport  @relation("FlightDepartureAirport", fields: [departureAirportId], references: [id], onDelete: Restrict)
+  arrivalAirport     AviationAirport  @relation("FlightArrivalAirport", fields: [arrivalAirportId], references: [id], onDelete: Restrict)
+
+  @@index([departureAirportId, departureAt, active], map: "aviation_flights_departure_lookup_idx")
+  @@index([arrivalAirportId, arrivalAt, active], map: "aviation_flights_arrival_lookup_idx")
+  @@index([serviceDate, active], map: "aviation_flights_service_date_idx")
+  @@map("aviation_flight_instances")
+}
+
+model HubTransferLink {
+  id                      BigInt       @id @default(autoincrement())
+  fromHubId               BigInt       @map("from_hub_id")
+  toHubId                 BigInt       @map("to_hub_id")
+  aerialDistanceKm        Decimal      @map("aerial_distance_km") @db.Decimal(10, 2)
+  estimatedRoadDistanceKm Decimal      @map("estimated_road_distance_km") @db.Decimal(10, 2)
+  travelMinutes           Int          @map("travel_minutes")
+  averageSpeedKph         Decimal      @map("average_speed_kph") @db.Decimal(6, 2)
+  detourFactor            Decimal      @map("detour_factor") @db.Decimal(5, 2)
+  method                  String       @default("AERIAL_DISTANCE_DETOUR_FACTOR") @db.VarChar(50)
+  active                  Boolean      @default(true)
+  createdAt               DateTime     @default(now()) @map("created_at")
+  updatedAt               DateTime     @default(now()) @updatedAt @map("updated_at")
+  fromHub                 TransportHub @relation("HubTransferFrom", fields: [fromHubId], references: [id], onDelete: Cascade)
+  toHub                   TransportHub @relation("HubTransferTo", fields: [toHubId], references: [id], onDelete: Cascade)
+
+  @@unique([fromHubId, toHubId], map: "hub_transfer_links_pair_key")
+  @@index([fromHubId, active], map: "hub_transfer_links_from_active_idx")
+  @@map("hub_transfer_links")
+}
+
+model JourneyRoutingPolicy {
+  id                               Int      @id @default(1)
+  version                          Int      @default(1)
+  active                           Boolean  @default(true)
+  roadSpeedKph                     Decimal  @default(30) @map("road_speed_kph") @db.Decimal(6, 2)
+  longDistanceRoadSpeedKph         Decimal  @default(60) @map("long_distance_road_speed_kph") @db.Decimal(6, 2)
+  roadSpeedDistanceThresholdKm     Decimal  @default(50) @map("road_speed_distance_threshold_km") @db.Decimal(6, 2)
+  roadDetourFactor                 Decimal  @default(1.5) @map("road_detour_factor") @db.Decimal(5, 2)
+  initialRailBufferMinutes         Int      @default(30) @map("initial_rail_buffer_minutes")
+  initialFlightBufferMinutes       Int      @default(30) @map("initial_flight_buffer_minutes")
+  railToRailMinutes                Int      @default(10) @map("rail_to_rail_minutes")
+  railToFlightBufferMinutes        Int      @default(0) @map("rail_to_flight_buffer_minutes")
+  flightToRailExitMinutes          Int      @default(0) @map("flight_to_rail_exit_minutes")
+  flightToRailBufferMinutes        Int      @default(0) @map("flight_to_rail_buffer_minutes")
+  sameAirportFlightTransferMinutes Int      @default(30) @map("same_airport_flight_transfer_minutes")
+  maximumTransfers                 Int      @default(3) @map("maximum_transfers")
+  searchHorizonDays                Int      @default(3) @map("search_horizon_days")
+  updatedAt                        DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("journey_routing_policies")
 }

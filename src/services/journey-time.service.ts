@@ -67,6 +67,15 @@ export function minuteToInstant(
     return new Date(clock.serviceDayStartInstantMs + totalMinute * 60_000);
 }
 
+export function instantToMinute(
+    clock: RailwaySearchClock,
+    instant: Date
+): number {
+    return Math.floor(
+        (instant.getTime() - clock.serviceDayStartInstantMs) / 60_000
+    );
+}
+
 export function formatRailwayDateTime(date: Date): string {
     const parts = zonedParts(date);
     const asUtc = Date.UTC(

@@ -1,7 +1,9 @@
 import { createHash } from "crypto";
+import { JourneyRoutingPolicy } from "@prisma/client";
 import { BoundedAsyncTtlCache } from "../cache/bounded-async-ttl-cache";
 import { ApiError } from "../errors/api.error";
 import { NearbyRailwayStation } from "../repositories/nearby-railway-station.repository";
+import { loadRoutingPolicy } from "../repositories/multimodal-routing.repository";
 import {
     AdditionalTrainStation,
     AlternativeBoardingStation,
@@ -30,18 +32,11 @@ import {
 } from "./journey-time.service";
 import { getNearbyRailwayStations } from "./nearby-railway-station.service";
 import {
-    MINIMUM_RAIL_TRANSFER_MINUTES,
-    MAXIMUM_TRAIN_LEGS,
-    RAILWAY_SEARCH_HORIZON_DAYS,
     RailwayPath,
+    resolveRailwayRoutingLimits,
     searchRailwayProvider
 } from "./railway-provider.service";
-import {
-    AVERAGE_ROAD_SPEED_KPH,
-    BOARDING_BUFFER_MINUTES,
-    calculateStationAccess,
-    ROAD_DISTANCE_DETOUR_FACTOR
-} from "./station-access.service";
+import { calculateStationAccess } from "./station-access.service";
 
 type SourceCandidateTiming = {
     station: NearbyRailwayStation;
@@ -187,7 +182,8 @@ function buildOption(
     source: SourceCandidateTiming,
     destination: NearbyRailwayStation,
     request: JourneySearchInput,
-    clock: RailwaySearchClock
+    clock: RailwaySearchClock,
+    policy: JourneyRoutingPolicy
 ): JourneySearchOption {
     const dateOnlySearch = request.departureDate !== undefined;
     const sourceStation = publicCandidate(source.station);
@@ -205,7 +201,8 @@ function buildOption(
         "Destination"
     );
     const destinationAccess = calculateStationAccess(
-        destination.aerialDistanceKm
+        destination.aerialDistanceKm,
+        policy
     );
     const trainGroups = groupTrainConnections(path.connections);
     const railLegs = trainGroups.map(group => railLeg(group, clock));
@@ -220,11 +217,11 @@ function buildOption(
     );
     const sourceDepartureMinute = dateOnlySearch
         ? path.departureMinute
-            - BOARDING_BUFFER_MINUTES
+            - policy.initialRailBufferMinutes
             - source.roadTravelMinutes
         : clock.requestedMinute;
     const stationArrivalMinute = dateOnlySearch
-        ? path.departureMinute - BOARDING_BUFFER_MINUTES
+        ? path.departureMinute - policy.initialRailBufferMinutes
         : source.stationArrivalMinute;
     const readyMinute = dateOnlySearch
         ? path.departureMinute
@@ -336,7 +333,7 @@ function buildOption(
                 source.estimatedRoadDistanceKm
             ),
             travelMinutes: source.roadTravelMinutes,
-            boardingBufferMinutes: BOARDING_BUFFER_MINUTES,
+            boardingBufferMinutes: policy.initialRailBufferMinutes,
             stationArrivalAt: formatRailwayDateTime(stationArrivalInstant),
             readyToBoardAt: formatRailwayDateTime(readyInstant)
         },
@@ -366,7 +363,7 @@ function buildOption(
         railTransferWaitingMinutes,
         totalJourneyMinutes: dateOnlySearch
             ? source.roadTravelMinutes
-                + BOARDING_BUFFER_MINUTES
+                + policy.initialRailBufferMinutes
                 + railwayElapsedMinutes
                 + destinationAccess.travelMinutes
             : path.arrivalMinute
@@ -387,14 +384,11 @@ function compareJourneyOptions(
     left: JourneySearchOption,
     right: JourneySearchOption
 ): number {
-    const leftDirect = left.numberOfTransfers === 0 ? 0 : 1;
-    const rightDirect = right.numberOfTransfers === 0 ? 0 : 1;
-    return leftDirect - rightDirect
-        || left.totalJourneyMinutes - right.totalJourneyMinutes
+    return left.totalJourneyMinutes - right.totalJourneyMinutes
+        || left.numberOfTransfers - right.numberOfTransfers
         || left.sourceAccess.travelMinutes - right.sourceAccess.travelMinutes
         || left.preTrainWaitingMinutes - right.preTrainWaitingMinutes
         || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt)
-        || left.numberOfTransfers - right.numberOfTransfers
         || left.railTransferWaitingMinutes
             - right.railTransferWaitingMinutes;
 }
@@ -524,8 +518,7 @@ function groupJourneyOptions(
                 leg.mode === "TRANSFER"
                 && leg.transferType === "RAIL_TRANSFER"
         );
-        const overallScoreMinutes = recommended.totalJourneyMinutes
-            + recommended.numberOfTransfers * 30;
+        const overallScoreMinutes = recommended.totalJourneyMinutes;
         results.push({
             key,
             options: groupOptions,
@@ -576,10 +569,11 @@ function boardingStationResults(
     sourceStations: NearbyRailwayStation[],
     groupedJourneys: GroupedJourney[],
     recommendedStationId: string | undefined,
-    limit: number
+    limit: number,
+    policy: JourneyRoutingPolicy
 ): BoardingStationResult[] {
     const stations = sourceStations.map(station => {
-        const access = calculateStationAccess(station.aerialDistanceKm);
+        const access = calculateStationAccess(station.aerialDistanceKm, policy);
         const matchingGroups = groupedJourneys.filter(group =>
             group.options.some(
                 option => option.boardingStation.id === station.id
@@ -659,7 +653,8 @@ async function executeCoordinateRailwayJourneySearch(
     const clock = dateOnlySearch
         ? createRailwayDateSearchClock(request.departureDate)
         : createRailwaySearchClock(request.departureAt);
-    const [sourceStations, destinationStations] = await Promise.all([
+    const [policy, sourceStations, destinationStations] = await Promise.all([
+        loadRoutingPolicy(),
         getNearbyRailwayStations(
             request.origin.latitude,
             request.origin.longitude,
@@ -675,6 +670,7 @@ async function executeCoordinateRailwayJourneySearch(
             "ALIGHTING"
         )
     ]);
+    const routingLimits = resolveRailwayRoutingLimits(policy);
 
     if (sourceStations.length === 0) {
         throw new ApiError(
@@ -692,7 +688,8 @@ async function executeCoordinateRailwayJourneySearch(
     const sourceTimings: SourceCandidateTiming[] = sourceStations.map(
         station => {
             const access = calculateStationAccess(
-                station.aerialDistanceKm
+                station.aerialDistanceKm,
+                policy
             );
             const stationArrivalMinute =
                 dateOnlySearch
@@ -705,7 +702,7 @@ async function executeCoordinateRailwayJourneySearch(
                 stationArrivalMinute,
                 readyMinute: dateOnlySearch
                     ? 0
-                    : stationArrivalMinute + BOARDING_BUFFER_MINUTES
+                    : stationArrivalMinute + policy.initialRailBufferMinutes
             };
         }
     );
@@ -731,6 +728,7 @@ async function executeCoordinateRailwayJourneySearch(
         new Set(destinationStations.map(station => station.id)),
         clock.serviceDate,
         internalResultLimit,
+        routingLimits,
         dateOnlySearch ? 24 * 60 : undefined
     );
 
@@ -741,7 +739,7 @@ async function executeCoordinateRailwayJourneySearch(
                 path.destinationStationId
             );
             return source && destination
-                ? buildOption(path, source, destination, request, clock)
+                ? buildOption(path, source, destination, request, clock, policy)
                 : null;
         })
         .filter((option): option is JourneySearchOption => option !== null)
@@ -780,12 +778,16 @@ async function executeCoordinateRailwayJourneySearch(
             aerialDistanceMethod: "POSTGIS_GEODESIC",
             roadDistanceMethod: "AERIAL_DISTANCE_DETOUR_FACTOR",
             roadDistanceAccuracy: "ESTIMATED",
-            detourFactor: ROAD_DISTANCE_DETOUR_FACTOR,
-            averageRoadSpeedKph: AVERAGE_ROAD_SPEED_KPH,
-            boardingBufferMinutes: BOARDING_BUFFER_MINUTES,
-            minimumRailTransferMinutes: MINIMUM_RAIL_TRANSFER_MINUTES,
-            maximumTrainLegs: MAXIMUM_TRAIN_LEGS,
-            searchHorizonDays: RAILWAY_SEARCH_HORIZON_DAYS
+            detourFactor: Number(policy.roadDetourFactor),
+            averageRoadSpeedKph: Number(policy.longDistanceRoadSpeedKph),
+            shortDistanceRoadSpeedKph: Number(policy.roadSpeedKph),
+            roadDistanceSpeedThresholdKm: Number(
+                policy.roadSpeedDistanceThresholdKm
+            ),
+            boardingBufferMinutes: policy.initialRailBufferMinutes,
+            minimumRailTransferMinutes: routingLimits.minimumRailTransferMinutes,
+            maximumTrainLegs: routingLimits.maxTrainLegs,
+            searchHorizonDays: routingLimits.searchHorizonDays
         },
         search: {
             sourceCandidatesEvaluated: sourceStations.length,
@@ -798,7 +800,8 @@ async function executeCoordinateRailwayJourneySearch(
             sourceStations,
             groupedJourneys,
             trainResults[0]?.recommendedBoardingStation.id,
-            request.options.boardingStationLimit
+            request.options.boardingStationLimit,
+            policy
         ),
         trainResults,
         nearbyStationsWithAdditionalTrains: additionalTrainStations(

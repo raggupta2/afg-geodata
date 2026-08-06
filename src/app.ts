@@ -5,6 +5,7 @@ import pinoHttp from "pino-http";
 import collectRoutes from "./routes/collect.routes";
 import healthRoutes from "./routes/health.routes";
 import railwayRoutes from "./routes/railway.routes";
+import journeyRoutes from "./routes/journey.routes";
 import path from "path";
 import { ApiError } from "./errors/api.error";
 import { logger } from "./config/logger";
@@ -27,6 +28,7 @@ app.use(
 );
 
 app.use("/api/v1/railways", railwayRoutes );
+app.use("/api/v1/journeys", journeyRoutes);
 
 app.use(
     (
