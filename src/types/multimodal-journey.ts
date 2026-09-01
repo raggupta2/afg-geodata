@@ -1,5 +1,11 @@
 import { Coordinates } from "./journey-search";
 
+export type JourneyTypeFilter =
+    | "RAIL_ONLY"
+    | "FLIGHT_ONLY"
+    | "RAIL_TO_FLIGHT"
+    | "FLIGHT_TO_RAIL";
+
 export type MultimodalSearchInput = {
     origin: Coordinates;
     destination: Coordinates;
@@ -11,6 +17,9 @@ export type MultimodalSearchInput = {
         destinationAirportRadiusKm: number;
         candidatesPerMode: number;
         maximumTransfers?: number;
+        journeyTypes?: JourneyTypeFilter[];
+        resultOffset?: number;
+        pageSize?: number;
         resultLimit: number;
     };
 };
@@ -64,6 +73,7 @@ export type MultimodalSearchResult = {
         origin: Coordinates;
         destination: Coordinates;
         departureAt: string;
+        journeyTypes?: JourneyTypeFilter[];
         timezone: "Asia/Kolkata";
     };
     policy: {
@@ -90,6 +100,13 @@ export type MultimodalSearchResult = {
         destinationHubsEvaluated: number;
         expandedStates: number;
         truncated: boolean;
+    };
+    pagination: {
+        offset: number;
+        pageSize: number;
+        returned: number;
+        total: number;
+        hasMore: boolean;
     };
     journeyResults: MultimodalJourneyResult[];
 };

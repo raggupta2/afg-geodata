@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { BoundedAsyncTtlCache } from "../cache/bounded-async-ttl-cache";
 import {
+    JourneyTypeFilter,
     MultimodalJourneyResult,
     MultimodalLeg,
     MultimodalPlace,
@@ -32,6 +33,7 @@ import { JourneyTrainResult } from "../types/journey-search";
 type FlightRecord = Awaited<ReturnType<typeof loadFlightInstances>>[number];
 type Policy = Awaited<ReturnType<typeof loadRoutingPolicy>>;
 type TransferRecord = Awaited<ReturnType<typeof loadTransferLinks>>[number];
+type CachedMultimodalSearchResult = Omit<MultimodalSearchResult, "pagination">;
 
 type SearchState = {
     hubId: string;
@@ -200,10 +202,17 @@ function remainingTimeHeuristicMs(
     return (distanceKm / FASTEST_MODE_SPEED_KPH) * 60 * 60 * 1000 * HEURISTIC_WEIGHT;
 }
 
-const resultCache = new BoundedAsyncTtlCache<MultimodalSearchResult>(
+const resultCache = new BoundedAsyncTtlCache<CachedMultimodalSearchResult>(
     Number(process.env.MULTIMODAL_RESULT_CACHE_TTL_MS ?? 60_000),
     Number(process.env.MULTIMODAL_RESULT_CACHE_MAX_ENTRIES ?? 500)
 );
+
+const JOURNEY_TYPE_FILTERS: JourneyTypeFilter[] = [
+    "RAIL_ONLY",
+    "FLIGHT_ONLY",
+    "RAIL_TO_FLIGHT",
+    "FLIGHT_TO_RAIL"
+];
 
 const round = (value: number): number => Math.round(value * 10) / 10;
 const iso = (milliseconds: number): string => new Date(
@@ -237,8 +246,8 @@ function endpointPlace(
     };
 }
 
-function access(hub: NearbyRoutingHub, policy: Policy) {
-    const roadKm = hub.aerialDistanceKm * Number(policy.roadDetourFactor);
+function roadAccess(aerialDistanceKm: number, policy: Policy) {
+    const roadKm = aerialDistanceKm * Number(policy.roadDetourFactor);
     const roadSpeedKph = roadKm > Number(policy.roadSpeedDistanceThresholdKm)
         ? Number(policy.longDistanceRoadSpeedKph)
         : Number(policy.roadSpeedKph);
@@ -247,6 +256,10 @@ function access(hub: NearbyRoutingHub, policy: Policy) {
         roadKm,
         minutes: Math.ceil(roadKm / roadSpeedKph * 60)
     };
+}
+
+function access(hub: NearbyRoutingHub, policy: Policy) {
+    return roadAccess(hub.aerialDistanceKm, policy);
 }
 
 function waitLeg(
@@ -302,6 +315,51 @@ function journeyType(modes: Array<"RAIL" | "FLIGHT">): MultimodalJourneyResult["
     return unique.has("FLIGHT") ? "FLIGHT_ONLY" : "RAIL_ONLY";
 }
 
+function matchesJourneyType(
+    result: MultimodalJourneyResult,
+    filter: JourneyTypeFilter
+): boolean {
+    if (filter === "RAIL_ONLY") return result.journeyType === "RAIL_ONLY";
+    if (filter === "FLIGHT_ONLY") return result.journeyType === "FLIGHT_ONLY";
+    const modes = result.legs
+        .filter(leg => leg.mode === "RAIL" || leg.mode === "FLIGHT")
+        .map(leg => leg.mode);
+    const [from, to] = filter === "RAIL_TO_FLIGHT"
+        ? ["RAIL", "FLIGHT"]
+        : ["FLIGHT", "RAIL"];
+    return modes.some((mode, index) => mode === from && modes[index + 1] === to);
+}
+
+function retainFilterableCandidates(
+    results: MultimodalJourneyResult[],
+    resultLimit: number
+): MultimodalJourneyResult[] {
+    const sorted = [...results].sort(compareMultimodalJourneyResults);
+    const retained = new Set<MultimodalJourneyResult>(sorted.slice(0, resultLimit));
+    for (const filter of JOURNEY_TYPE_FILTERS) {
+        sorted
+            .filter(result => matchesJourneyType(result, filter))
+            .slice(0, resultLimit)
+            .forEach(result => retained.add(result));
+    }
+    return [...retained].sort(compareMultimodalJourneyResults);
+}
+
+export function selectMultimodalJourneyResults(
+    results: MultimodalJourneyResult[],
+    journeyTypes: JourneyTypeFilter[] | undefined,
+    resultLimit: number
+): MultimodalJourneyResult[] {
+    const matching = journeyTypes?.length
+        ? results.filter(result =>
+            journeyTypes.some(filter => matchesJourneyType(result, filter)))
+        : [...results];
+    return matching
+        .sort(compareMultimodalJourneyResults)
+        .slice(0, resultLimit)
+        .map((result, index) => ({ ...result, rank: index + 1 }));
+}
+
 function dateOnlyOrigin(
     legs: MultimodalLeg[],
     policy: Policy
@@ -353,19 +411,52 @@ function resultFromState(
     request: MultimodalSearchInput,
     policy: Policy
 ): MultimodalJourneyResult {
-    const finalAccess = access(destinationHub, policy);
-    const finalArrivalMs = state.arrivalMs + finalAccess.minutes * 60_000;
     const destination = endpointPlace(request, "DESTINATION");
+    let completionLegs = state.legs;
+    let completionHub = place(destinationHub);
+    let completionHubId = destinationHub.id;
+    let completionMs = state.arrivalMs;
+    let completionAerialDistanceKm = destinationHub.aerialDistanceKm;
+
+    // A hub-to-hub road transfer is useful only when it connects two scheduled
+    // services. If the search entered the destination set through a transfer but
+    // boarded no service afterward, finish by road from the last train/flight hub
+    // instead of showing an artificial train-to-airport (or airport-to-train) leg.
+    let lastNonTransferIndex = completionLegs.length - 1;
+    while (
+        lastNonTransferIndex >= 0
+        && completionLegs[lastNonTransferIndex].mode === "TRANSFER"
+    ) {
+        lastNonTransferIndex -= 1;
+    }
+    if (lastNonTransferIndex < completionLegs.length - 1) {
+        completionLegs = completionLegs.slice(0, lastNonTransferIndex + 1);
+        const lastLeg = completionLegs[completionLegs.length - 1];
+        if (lastLeg) {
+            completionHub = lastLeg.to;
+            completionHubId = completionHub.id ?? destinationHub.id;
+            completionMs = Date.parse(lastLeg.arrivalAt);
+            completionAerialDistanceKm = haversineKm(
+                completionHub.latitude,
+                completionHub.longitude,
+                request.destination.latitude,
+                request.destination.longitude
+            );
+        }
+    }
+
+    const finalAccess = roadAccess(completionAerialDistanceKm, policy);
+    const finalArrivalMs = completionMs + finalAccess.minutes * 60_000;
     const itineraryKey = state.serviceKeys.join("|");
-    const originJourney = dateOnlyOrigin(state.legs, policy);
+    const originJourney = dateOnlyOrigin(completionLegs, policy);
     return {
         id: createHash("sha256").update(
-            `${state.departureHub.id}|${destinationHub.id}|${itineraryKey}`
+            `${state.departureHub.id}|${completionHubId}|${itineraryKey}`
         ).digest("hex").slice(0, 16),
         rank: 0,
         journeyType: journeyType(state.modes),
         departureHub: place(state.departureHub),
-        arrivalHub: place(destinationHub),
+        arrivalHub: completionHub,
         departureAt: iso(originJourney.departureMs),
         finalArrivalAt: iso(finalArrivalMs),
         totalJourneyMinutes: Math.ceil(
@@ -376,12 +467,12 @@ function resultFromState(
         modes: [...new Set(state.modes)],
         legs: [...originJourney.legs, {
             mode: "LOCAL",
-            from: place(destinationHub),
+            from: completionHub,
             to: destination,
-            departureAt: iso(state.arrivalMs),
+            departureAt: iso(completionMs),
             arrivalAt: iso(finalArrivalMs),
             durationMinutes: finalAccess.minutes,
-            distanceKm: round(destinationHub.aerialDistanceKm),
+            distanceKm: round(completionAerialDistanceKm),
             estimatedRoadDistanceKm: round(finalAccess.roadKm)
         }]
     };
@@ -605,7 +696,9 @@ function pruneDominatedAccessPaths(
     );
 }
 
-async function executeSearch(request: MultimodalSearchInput): Promise<MultimodalSearchResult> {
+async function executeSearch(
+    request: MultimodalSearchInput
+): Promise<CachedMultimodalSearchResult> {
     const requested = new Date(`${request.departureAt}T00:00:00+05:30`);
     const requestedMs = requested.getTime();
     const firstServiceDateEndMs = requestedMs + 24 * 60 * 60 * 1000;
@@ -956,10 +1049,10 @@ async function executeSearch(request: MultimodalSearchInput): Promise<Multimodal
         prunedMultimodal,
         railwayOnly.trainResults.map(convertRailwayResult)
     );
-    const selected = combined
-        .sort(compareMultimodalJourneyResults)
-        .slice(0, request.options.resultLimit)
-        .map((result, index) => ({ ...result, rank: index + 1 }));
+    const filterableCandidates = retainFilterableCandidates(
+        combined,
+        request.options.resultLimit
+    );
     const available = coverage.counts.get("AVAILABLE") ?? 0;
     const empty = coverage.counts.get("EMPTY_REPORTED") ?? 0;
     const covered = [...coverage.counts.values()].reduce((sum, count) => sum + count, 0);
@@ -971,6 +1064,7 @@ async function executeSearch(request: MultimodalSearchInput): Promise<Multimodal
             origin: request.origin,
             destination: request.destination,
             departureAt: request.departureAt,
+            journeyTypes: request.options.journeyTypes,
             timezone: "Asia/Kolkata"
         },
         policy: {
@@ -1000,13 +1094,56 @@ async function executeSearch(request: MultimodalSearchInput): Promise<Multimodal
             expandedStates,
             truncated
         },
-        journeyResults: selected
+        journeyResults: filterableCandidates
     };
 }
 
 export async function searchMultimodalJourneys(
     request: MultimodalSearchInput
 ): Promise<MultimodalSearchResult> {
-    const key = createHash("sha256").update(JSON.stringify(request)).digest("hex");
-    return resultCache.getOrLoad(key, () => executeSearch(request));
+    const searchRequest: MultimodalSearchInput = {
+        ...request,
+        options: {
+            ...request.options,
+            journeyTypes: undefined,
+            resultOffset: undefined,
+            pageSize: undefined
+        }
+    };
+    const key = createHash("sha256")
+        .update(JSON.stringify(searchRequest))
+        .digest("hex");
+    const result = await resultCache.getOrLoad(
+        key,
+        () => executeSearch(searchRequest)
+    );
+    const selected = selectMultimodalJourneyResults(
+        result.journeyResults,
+        request.options.journeyTypes,
+        request.options.resultLimit
+    );
+    const offset = Math.min(
+        request.options.resultOffset ?? 0,
+        request.options.resultLimit
+    );
+    const pageSize = Math.min(
+        request.options.pageSize ?? request.options.resultLimit,
+        request.options.resultLimit - offset
+    );
+    const journeyResults = selected.slice(offset, offset + pageSize);
+    return {
+        ...result,
+        request: {
+            ...result.request,
+            journeyTypes: request.options.journeyTypes
+        },
+        pagination: {
+            offset,
+            pageSize,
+            returned: journeyResults.length,
+            total: selected.length,
+            hasMore: offset + journeyResults.length < selected.length
+        },
+        journeyResults
+    };
 }

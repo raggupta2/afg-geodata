@@ -29,7 +29,15 @@ const options = z.object({
     destinationAirportRadiusKm: z.number().finite().min(5).max(200).default(100),
     candidatesPerMode: z.number().int().min(1).max(10).default(5),
     maximumTransfers: z.number().int().min(0).max(6).optional(),
-    resultLimit: z.number().int().min(1).max(60).default(50)
+    journeyTypes: z.array(z.enum([
+        "RAIL_ONLY",
+        "FLIGHT_ONLY",
+        "RAIL_TO_FLIGHT",
+        "FLIGHT_TO_RAIL"
+    ])).min(1).max(4).optional(),
+    resultOffset: z.number().int().min(0).max(49).optional(),
+    pageSize: z.number().int().min(1).max(20).optional(),
+    resultLimit: z.number().int().min(1).max(50).default(50)
 }).strict();
 
 const schema = z.object({

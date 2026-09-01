@@ -15,8 +15,20 @@ type ImportOptions = {
     staticOnly: boolean;
 };
 
+type StaticImportResult = {
+    imported: number;
+    failed: number;
+    skipped: boolean;
+};
+
+type ImportCache = Record<string, string>;
+
 const INDIA_TIMEZONE = "Asia/Kolkata";
 const INDIA_OFFSET = "+05:30";
+const IMPORT_CONCURRENCY = Math.max(
+    1,
+    Number(process.env.AVIATION_IMPORT_CONCURRENCY ?? 8)
+);
 
 function parseOptions(): ImportOptions {
     const values = new Map<string, string>();
@@ -61,6 +73,28 @@ function bigintValue(value: unknown): bigint | null {
     return parsed === null ? null : BigInt(Math.trunc(parsed));
 }
 
+function sha256Hex(data: string | Buffer): string {
+    return createHash("sha256").update(data).digest("hex");
+}
+
+async function runWithConcurrency<T>(
+    items: T[],
+    limit: number,
+    worker: (item: T) => Promise<void>
+): Promise<void> {
+    let cursor = 0;
+    async function run(): Promise<void> {
+        while (cursor < items.length) {
+            const item = items[cursor];
+            cursor += 1;
+            await worker(item);
+        }
+    }
+    await Promise.all(
+        Array.from({ length: Math.min(limit, items.length) }, run)
+    );
+}
+
 async function findStaticFile(directory: string, prefix: string): Promise<string> {
     const entries = await fs.readdir(directory);
     const match = entries.find(entry => entry.startsWith(prefix) && entry.endsWith(".json"));
@@ -68,56 +102,101 @@ async function findStaticFile(directory: string, prefix: string): Promise<string
     return path.join(directory, match);
 }
 
-async function readJson(file: string): Promise<unknown> {
-    return JSON.parse(await fs.readFile(file, "utf8"));
+function importCachePath(root: string): string {
+    return path.join(root, ".aviation-import-cache.json");
 }
 
-async function importCities(staticDirectory: string): Promise<number> {
+async function loadImportCache(root: string): Promise<ImportCache> {
+    try {
+        const raw = await fs.readFile(importCachePath(root), "utf8");
+        const parsed: unknown = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed as ImportCache : {};
+    } catch {
+        return {};
+    }
+}
+
+async function saveImportCache(root: string, cache: ImportCache): Promise<void> {
+    await fs.writeFile(importCachePath(root), JSON.stringify(cache, null, 2), "utf8");
+}
+
+async function importCities(
+    staticDirectory: string,
+    cache: ImportCache
+): Promise<StaticImportResult> {
     const file = await findStaticFile(staticDirectory, "cityDatabase_");
-    const records = await readJson(file);
+    const raw = await fs.readFile(file, "utf8");
+    const checksum = sha256Hex(raw);
+    if (cache.cities === checksum) {
+        return { imported: 0, failed: 0, skipped: true };
+    }
+    const records = JSON.parse(raw);
     if (!Array.isArray(records)) throw new Error("The city database must contain an array.");
+    const indiaRecords = (records as UnknownRecord[]).filter(
+        record => normalizedCode(record.codeIso2Country, 2) === "IN"
+    );
+
     let imported = 0;
-    for (const record of records as UnknownRecord[]) {
-        if (normalizedCode(record.codeIso2Country, 2) !== "IN") continue;
+    let failed = 0;
+    await runWithConcurrency(indiaRecords, IMPORT_CONCURRENCY, async record => {
         const iataCode = normalizedCode(record.codeIataCity, 3);
         const name = normalizedText(record.nameCity, 150);
         const latitude = numberValue(record.latitudeCity);
         const longitude = numberValue(record.longitudeCity);
-        if (!iataCode || !name || latitude === null || longitude === null) continue;
-        await prisma.transportCity.upsert({
-            where: { iataCode },
-            create: {
-                providerCityId: bigintValue(record.cityId),
-                iataCode,
-                name,
-                countryCode: "IN",
-                latitude,
-                longitude,
-                timezone: INDIA_TIMEZONE
-            },
-            update: {
-                providerCityId: bigintValue(record.cityId),
-                name,
-                latitude,
-                longitude,
-                timezone: INDIA_TIMEZONE
-            }
-        });
-        imported += 1;
-    }
-    return imported;
+        if (!iataCode || !name || latitude === null || longitude === null) return;
+        try {
+            await prisma.transportCity.upsert({
+                where: { iataCode },
+                create: {
+                    providerCityId: bigintValue(record.cityId),
+                    iataCode,
+                    name,
+                    countryCode: "IN",
+                    latitude,
+                    longitude,
+                    timezone: INDIA_TIMEZONE
+                },
+                update: {
+                    providerCityId: bigintValue(record.cityId),
+                    name,
+                    latitude,
+                    longitude,
+                    timezone: INDIA_TIMEZONE
+                }
+            });
+            imported += 1;
+        } catch (error) {
+            failed += 1;
+            console.error(`Failed to import city ${iataCode}:`, error);
+        }
+    });
+
+    if (failed === 0) cache.cities = checksum;
+    return { imported, failed, skipped: false };
 }
 
-async function importAirports(staticDirectory: string): Promise<number> {
+async function importAirports(
+    staticDirectory: string,
+    cache: ImportCache
+): Promise<StaticImportResult> {
     const file = await findStaticFile(staticDirectory, "airportDatabase_");
-    const records = await readJson(file);
+    const raw = await fs.readFile(file, "utf8");
+    const checksum = sha256Hex(raw);
+    if (cache.airports === checksum) {
+        return { imported: 0, failed: 0, skipped: true };
+    }
+    const records = JSON.parse(raw);
     if (!Array.isArray(records)) throw new Error("The airport database must contain an array.");
     const cities = new Map(
         (await prisma.transportCity.findMany()).map(city => [city.iataCode, city])
     );
+    const indiaRecords = (records as UnknownRecord[]).filter(
+        record => normalizedCode(record.codeIso2Country, 2) === "IN"
+    );
+
     let imported = 0;
-    for (const record of records as UnknownRecord[]) {
-        if (normalizedCode(record.codeIso2Country, 2) !== "IN") continue;
+    let failed = 0;
+    await runWithConcurrency(indiaRecords, IMPORT_CONCURRENCY, async record => {
         const providerAirportId = bigintValue(record.airportId);
         const iataCode = normalizedCode(record.codeIataAirport, 3);
         const icaoCode = normalizedCode(record.codeIcaoAirport, 4);
@@ -126,87 +205,113 @@ async function importAirports(staticDirectory: string): Promise<number> {
         const latitude = numberValue(record.latitudeAirport);
         const longitude = numberValue(record.longitudeAirport);
         if (!providerAirportId || !iataCode || !name || latitude === null || longitude === null) {
-            continue;
+            return;
         }
-        const city = cityIataCode ? cities.get(cityIataCode) : undefined;
-        const hub = await prisma.transportHub.upsert({
-            where: { hubType_code: { hubType: "AIRPORT", code: iataCode } },
-            create: {
-                cityId: city?.id,
-                hubType: "AIRPORT",
-                code: iataCode,
-                name,
-                latitude,
-                longitude,
-                timezone: INDIA_TIMEZONE
-            },
-            update: {
-                cityId: city?.id,
-                name,
-                latitude,
-                longitude,
-                timezone: INDIA_TIMEZONE,
-                active: true
-            }
-        });
-        await prisma.aviationAirport.upsert({
-            where: { iataCode },
-            create: {
-                providerAirportId,
-                hubId: hub.id,
-                iataCode,
-                icaoCode,
-                cityIataCode,
-                countryCode: "IN",
-                geonameId: bigintValue(record.geonameId)
-            },
-            update: {
-                providerAirportId,
-                hubId: hub.id,
-                icaoCode,
-                cityIataCode,
-                geonameId: bigintValue(record.geonameId)
-            }
-        });
-        imported += 1;
-    }
-    return imported;
+        try {
+            const city = cityIataCode ? cities.get(cityIataCode) : undefined;
+            const hub = await prisma.transportHub.upsert({
+                where: { hubType_code: { hubType: "AIRPORT", code: iataCode } },
+                create: {
+                    cityId: city?.id,
+                    hubType: "AIRPORT",
+                    code: iataCode,
+                    name,
+                    latitude,
+                    longitude,
+                    timezone: INDIA_TIMEZONE
+                },
+                update: {
+                    cityId: city?.id,
+                    name,
+                    latitude,
+                    longitude,
+                    timezone: INDIA_TIMEZONE,
+                    active: true
+                }
+            });
+            await prisma.aviationAirport.upsert({
+                where: { iataCode },
+                create: {
+                    providerAirportId,
+                    hubId: hub.id,
+                    iataCode,
+                    icaoCode,
+                    cityIataCode,
+                    countryCode: "IN",
+                    geonameId: bigintValue(record.geonameId)
+                },
+                update: {
+                    providerAirportId,
+                    hubId: hub.id,
+                    icaoCode,
+                    cityIataCode,
+                    geonameId: bigintValue(record.geonameId)
+                }
+            });
+            imported += 1;
+        } catch (error) {
+            failed += 1;
+            console.error(`Failed to import airport ${iataCode}:`, error);
+        }
+    });
+
+    if (failed === 0) cache.airports = checksum;
+    return { imported, failed, skipped: false };
 }
 
-async function importAirlines(staticDirectory: string): Promise<number> {
+async function importAirlines(
+    staticDirectory: string,
+    cache: ImportCache
+): Promise<StaticImportResult> {
     const file = await findStaticFile(staticDirectory, "airlineDatabase_");
-    const records = await readJson(file);
+    const raw = await fs.readFile(file, "utf8");
+    const checksum = sha256Hex(raw);
+    if (cache.airlines === checksum) {
+        return { imported: 0, failed: 0, skipped: true };
+    }
+    const records = JSON.parse(raw);
     if (!Array.isArray(records)) throw new Error("The airline database must contain an array.");
+    const indiaRecords = (records as UnknownRecord[]).filter(
+        record => normalizedCode(record.codeIso2Country, 2) === "IN"
+    );
+
     let imported = 0;
-    for (const record of records as UnknownRecord[]) {
-        if (normalizedCode(record.codeIso2Country, 2) !== "IN") continue;
+    let failed = 0;
+    await runWithConcurrency(indiaRecords, IMPORT_CONCURRENCY, async record => {
         const providerAirlineId = bigintValue(record.airlineId);
         const name = normalizedText(record.nameAirline, 200);
-        if (!providerAirlineId || !name) continue;
-        await prisma.aviationAirline.upsert({
-            where: { providerAirlineId },
-            create: {
-                providerAirlineId,
-                iataCode: normalizedCode(record.codeIataAirline, 3),
-                icaoCode: normalizedCode(record.codeIcaoAirline, 4),
-                name,
-                callsign: normalizedText(record.callsign, 100),
-                countryCode: "IN",
-                providerStatus: normalizedText(record.statusAirline, 30),
-                serviceType: normalizedText(record.type, 30)
-            },
-            update: {
-                iataCode: normalizedCode(record.codeIataAirline, 3),
-                icaoCode: normalizedCode(record.codeIcaoAirline, 4),
-                name,
-                callsign: normalizedText(record.callsign, 100),
-                providerStatus: normalizedText(record.statusAirline, 30),
-                serviceType: normalizedText(record.type, 30)
-            }
-        });
-        imported += 1;
-    }
-    return imported;
+        if (!providerAirlineId || !name) return;
+        try {
+            await prisma.aviationAirline.upsert({
+                where: { providerAirlineId },
+                create: {
+                    providerAirlineId,
+                    iataCode: normalizedCode(record.codeIataAirline, 3),
+                    icaoCode: normalizedCode(record.codeIcaoAirline, 4),
+                    name,
+                    callsign: normalizedText(record.callsign, 100),
+                    countryCode: "IN",
+                    providerStatus: normalizedText(record.statusAirline, 30),
+                    serviceType: normalizedText(record.type, 30)
+                },
+                update: {
+                    iataCode: normalizedCode(record.codeIataAirline, 3),
+                    icaoCode: normalizedCode(record.codeIcaoAirline, 4),
+                    name,
+                    callsign: normalizedText(record.callsign, 100),
+                    providerStatus: normalizedText(record.statusAirline, 30),
+                    serviceType: normalizedText(record.type, 30)
+                }
+            });
+            imported += 1;
+        } catch (error) {
+            failed += 1;
+            console.error(`Failed to import airline ${providerAirlineId}:`, error);
+        }
+    });
+
+    if (failed === 0) cache.airlines = checksum;
+    return { imported, failed, skipped: false };
 }
 
 function scheduleInstant(serviceDate: string, time: unknown): Date | null {
@@ -219,20 +324,55 @@ function serviceDateValue(serviceDate: string): Date {
     return new Date(`${serviceDate}T00:00:00.000Z`);
 }
 
+function scheduleImportKey(sourceCode: string, serviceDate: string): string {
+    return `${sourceCode}|${serviceDate}`;
+}
+
+async function loadExistingScheduleChecksums(
+    airportCodes: string[],
+    from?: string,
+    to?: string
+): Promise<Map<string, Set<string>>> {
+    const where: Prisma.AviationScheduleImportWhereInput = {
+        sourceAirportCode: { in: airportCodes }
+    };
+    if (from || to) {
+        where.serviceDate = {
+            ...(from ? { gte: serviceDateValue(from) } : {}),
+            ...(to ? { lte: serviceDateValue(to) } : {})
+        };
+    }
+    const rows = await prisma.aviationScheduleImport.findMany({
+        where,
+        select: { sourceAirportCode: true, serviceDate: true, checksum: true }
+    });
+    const index = new Map<string, Set<string>>();
+    for (const row of rows) {
+        const key = scheduleImportKey(
+            row.sourceAirportCode,
+            row.serviceDate.toISOString().slice(0, 10)
+        );
+        const checksums = index.get(key) ?? new Set<string>();
+        checksums.add(row.checksum);
+        index.set(key, checksums);
+    }
+    return index;
+}
+
 async function importScheduleFile(
     file: string,
     sourceCode: string,
     serviceDate: string,
     airports: Map<string, { id: bigint }>,
-    airlines: Map<string, { id: bigint }>
+    airlines: Map<string, { id: bigint }>,
+    existingChecksums: Map<string, Set<string>>
 ): Promise<{ accepted: number; skipped: boolean }> {
     const raw = await fs.readFile(file);
     const checksum = createHash("sha256").update(raw).digest("hex");
     const date = serviceDateValue(serviceDate);
-    const existing = await prisma.aviationScheduleImport.findFirst({
-        where: { sourceAirportCode: sourceCode, serviceDate: date, checksum }
-    });
-    if (existing) return { accepted: 0, skipped: true };
+    if (existingChecksums.get(scheduleImportKey(sourceCode, serviceDate))?.has(checksum)) {
+        return { accepted: 0, skipped: true };
+    }
 
     const sourceAirport = airports.get(sourceCode);
     if (!sourceAirport) return { accepted: 0, skipped: true };
@@ -469,7 +609,12 @@ async function refreshGeographyAndTransfers(): Promise<void> {
     `);
 }
 
-async function importSchedules(options: ImportOptions): Promise<{ files: number; flights: number }> {
+async function importSchedules(options: ImportOptions): Promise<{
+    files: number;
+    flights: number;
+    skippedFiles: number;
+    failedFiles: number;
+}> {
     const dataDirectory = path.join(options.root, "data");
     const airports = new Map(
         (await prisma.aviationAirport.findMany()).map(airport => [airport.iataCode, airport])
@@ -484,10 +629,11 @@ async function importSchedules(options: ImportOptions): Promise<{ files: number;
             .filter(entry => entry.isDirectory())
             .map(entry => entry.name.toUpperCase())
             .sort();
-    let files = 0;
-    let flights = 0;
-    for (const sourceCode of directories) {
-        if (!airports.has(sourceCode)) continue;
+    const relevantAirportCodes = directories.filter(code => airports.has(code));
+
+    type ScheduleWorkItem = { file: string; sourceCode: string; serviceDate: string };
+    const workItems: ScheduleWorkItem[] = [];
+    for (const sourceCode of relevantAirportCodes) {
         const directory = path.join(dataDirectory, sourceCode);
         let entries: string[];
         try {
@@ -499,31 +645,85 @@ async function importSchedules(options: ImportOptions): Promise<{ files: number;
             const serviceDate = entry.slice(0, 10);
             if (options.from && serviceDate < options.from) continue;
             if (options.to && serviceDate > options.to) continue;
-            const result = await importScheduleFile(
-                path.join(directory, entry),
-                sourceCode,
-                serviceDate,
-                airports,
-                airlines
-            );
-            if (!result.skipped) files += 1;
-            flights += result.accepted;
+            workItems.push({ file: path.join(directory, entry), sourceCode, serviceDate });
         }
     }
-    return { files, flights };
+
+    const existingChecksums = await loadExistingScheduleChecksums(
+        relevantAirportCodes,
+        options.from,
+        options.to
+    );
+
+    let files = 0;
+    let flights = 0;
+    let skippedFiles = 0;
+    let failedFiles = 0;
+
+    await runWithConcurrency(workItems, IMPORT_CONCURRENCY, async item => {
+        try {
+            const result = await importScheduleFile(
+                item.file,
+                item.sourceCode,
+                item.serviceDate,
+                airports,
+                airlines,
+                existingChecksums
+            );
+            if (result.skipped) {
+                skippedFiles += 1;
+            } else {
+                files += 1;
+                flights += result.accepted;
+            }
+        } catch (error) {
+            failedFiles += 1;
+            console.error(`Failed to import ${item.sourceCode} ${item.serviceDate}:`, error);
+        }
+    });
+
+    return { files, flights, skippedFiles, failedFiles };
 }
 
 async function main(): Promise<void> {
     const options = parseOptions();
     const staticDirectory = path.join(options.root, "Static Data");
-    const cities = await importCities(staticDirectory);
-    const airports = await importAirports(staticDirectory);
-    const airlines = await importAirlines(staticDirectory);
+    const cache = await loadImportCache(options.root);
+
+    const [citiesResult, airlinesResult] = await Promise.all([
+        importCities(staticDirectory, cache),
+        importAirlines(staticDirectory, cache)
+    ]);
+    const airportsResult = await importAirports(staticDirectory, cache);
+    await saveImportCache(options.root, cache);
+
     await refreshGeographyAndTransfers();
+
     const schedules = options.staticOnly
-        ? { files: 0, flights: 0 }
+        ? { files: 0, flights: 0, skippedFiles: 0, failedFiles: 0 }
         : await importSchedules(options);
-    console.log(JSON.stringify({ cities, airports, airlines, ...schedules }, null, 2));
+
+    console.log(JSON.stringify({
+        cities: citiesResult.imported,
+        citiesSkipped: citiesResult.skipped,
+        citiesFailed: citiesResult.failed,
+        airports: airportsResult.imported,
+        airportsSkipped: airportsResult.skipped,
+        airportsFailed: airportsResult.failed,
+        airlines: airlinesResult.imported,
+        airlinesSkipped: airlinesResult.skipped,
+        airlinesFailed: airlinesResult.failed,
+        ...schedules
+    }, null, 2));
+
+    if (
+        citiesResult.failed > 0
+        || airportsResult.failed > 0
+        || airlinesResult.failed > 0
+        || schedules.failedFiles > 0
+    ) {
+        process.exitCode = 1;
+    }
 }
 
 main()

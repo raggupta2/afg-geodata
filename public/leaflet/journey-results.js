@@ -1,7 +1,8 @@
 "use strict";
 
 const API_URL = window.APP_CONFIG?.API_URL || "/api/v1/";
-const PAGE_SIZE = 12;
+const PAGE_SIZE = 20;
+const MAX_JOURNEYS = 50;
 const SCHEDULED_MODES = new Set(["RAIL", "FLIGHT"]);
 const mobileFilterMedia = window.matchMedia("(max-width: 780px)");
 
@@ -9,7 +10,9 @@ const state = {
     journeys: [],
     visibleJourneys: [],
     journeyById: new Map(),
-    renderedCount: PAGE_SIZE,
+    totalJourneyCount: 0,
+    nextResultOffset: 0,
+    hasMoreJourneys: false,
     abortController: null,
     lastRequest: null,
     requestSequence: 0,
@@ -63,7 +66,7 @@ function bindEvents() {
     ]) input.addEventListener("change", applyFiltersAndSort);
 
     document.querySelectorAll('input[name="journeyType"]').forEach(input =>
-        input.addEventListener("change", applyFiltersAndSort)
+        input.addEventListener("change", refreshJourneyTypeFilter)
     );
     document.querySelectorAll("[data-quick-filter]").forEach(button =>
         button.addEventListener("click", () => toggleQuickFilter(button.dataset.quickFilter))
@@ -71,14 +74,11 @@ function bindEvents() {
     elements.airlineFilters.addEventListener("change", applyFiltersAndSort);
     elements.clearFiltersButton.addEventListener("click", clearFilters);
     elements.activeFilters.addEventListener("click", removeFilterFromChip);
-    elements.showMoreButton.addEventListener("click", () => {
-        state.renderedCount += PAGE_SIZE;
-        renderJourneyCards();
-    });
+    elements.showMoreButton.addEventListener("click", loadMoreJourneys);
     elements.journeyResults.addEventListener("click", toggleJourneyDetails);
     elements.retryButton.addEventListener("click", () => submitSearch(state.lastRequest));
     elements.emptyActionButton.addEventListener("click", () => {
-        if (state.journeys.length) clearFilters();
+        if (state.journeys.length || selectedJourneyTypes().length) clearFilters();
         else elements.departureAt.focus();
     });
     elements.openFiltersButton.addEventListener("click", openFilters);
@@ -288,37 +288,95 @@ function validateAndBuildRequest() {
             label: elements.destinationLabel.value.trim() || undefined
         },
         departureAt: departureDate,
-        options: { resultLimit: 50 }
+        options: {
+            resultOffset: 0,
+            pageSize: PAGE_SIZE,
+            resultLimit: MAX_JOURNEYS
+        }
     };
 }
 
 async function submitSearch(existingRequest = null) {
-    const request = existingRequest || validateAndBuildRequest();
-    if (!request) return; 
+    const baseRequest = existingRequest || validateAndBuildRequest();
+    if (!baseRequest) return;
+    const request = withJourneyTypeFilter(withJourneyPage(baseRequest, 0));
     state.lastRequest = request;
     state.abortController?.abort();
     state.abortController = new AbortController();
     const sequence = ++state.requestSequence;
     setLoading(true);
     try {
-        const response = await fetch(apiUrl("journeys/search"), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(request),
-            signal: state.abortController.signal
-        });
-        const body = await readResponseBody(response);
-        if (!response.ok || !body.success) {
-            throw new Error(body.message || `Journey search failed (${response.status}).`);
-        }
+        const data = await fetchJourneyPage(request, state.abortController.signal);
         if (sequence !== state.requestSequence) return;
-        receiveResults(body.data || {}, request);
+        receiveResults(data, request);
     } catch (error) {
         if (error.name === "AbortError" || sequence !== state.requestSequence) return;
         showError(error.message || "An unexpected error occurred while searching.");
     } finally {
         if (sequence === state.requestSequence) setLoading(false, true);
     }
+}
+
+async function loadMoreJourneys() {
+    if (!state.lastRequest || !state.hasMoreJourneys
+        || state.nextResultOffset >= MAX_JOURNEYS) return;
+    const request = withJourneyTypeFilter(
+        withJourneyPage(state.lastRequest, state.nextResultOffset)
+    );
+    state.abortController?.abort();
+    state.abortController = new AbortController();
+    const sequence = ++state.requestSequence;
+    elements.showMoreButton.disabled = true;
+    elements.showMoreButton.textContent = "Loading more journeys…";
+    hideFormError();
+    try {
+        const data = await fetchJourneyPage(request, state.abortController.signal);
+        if (sequence !== state.requestSequence) return;
+        receiveResults(data, request, true);
+    } catch (error) {
+        if (error.name === "AbortError" || sequence !== state.requestSequence) return;
+        showFormError(error.message || "More journeys could not be loaded.");
+    } finally {
+        if (sequence === state.requestSequence) renderShowMoreButton();
+    }
+}
+
+async function fetchJourneyPage(request, signal) {
+    const response = await fetch(apiUrl("journeys/search"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+        signal
+    });
+    const body = await readResponseBody(response);
+    if (!response.ok || !body.success) {
+        throw new Error(body.message || `Journey search failed (${response.status}).`);
+    }
+    return body.data || {};
+}
+
+function withJourneyTypeFilter(request) {
+    const options = { ...request.options };
+    const journeyTypes = selectedJourneyTypes();
+    if (journeyTypes.length) options.journeyTypes = journeyTypes;
+    else delete options.journeyTypes;
+    return { ...request, options };
+}
+
+function withJourneyPage(request, resultOffset) {
+    return {
+        ...request,
+        options: {
+            ...request.options,
+            resultOffset,
+            pageSize: PAGE_SIZE,
+            resultLimit: MAX_JOURNEYS
+        }
+    };
+}
+
+function refreshJourneyTypeFilter() {
+    if (state.lastRequest) submitSearch(state.lastRequest);
 }
 
 async function readResponseBody(response) {
@@ -328,18 +386,34 @@ async function readResponseBody(response) {
     catch { throw new Error("The server returned an unreadable response."); }
 }
 
-function receiveResults(data, request) {
+function receiveResults(data, request, append = false) {
     state.timeZone = data.request?.timezone || "Asia/Kolkata";
-    state.journeys = (Array.isArray(data.journeyResults) ? data.journeyResults : [])
+    const receivedJourneys = (Array.isArray(data.journeyResults) ? data.journeyResults : [])
         .map(normalizeJourney);
+    if (append) {
+        const existingIds = new Set(state.journeys.map(journey => journey.id));
+        state.journeys.push(
+            ...receivedJourneys.filter(journey => !existingIds.has(journey.id))
+        );
+    } else {
+        state.journeys = receivedJourneys;
+    }
     state.journeyById = new Map(state.journeys.map(journey => [journey.id, journey]));
-    state.renderedCount = PAGE_SIZE;
-    resetFilterControls();
+    const pagination = data.pagination || {};
+    const offset = Number(pagination.offset) || 0;
+    const returned = Number(pagination.returned) || receivedJourneys.length;
+    state.nextResultOffset = Math.min(MAX_JOURNEYS, offset + returned);
+    state.totalJourneyCount = Math.min(
+        MAX_JOURNEYS,
+        Math.max(state.journeys.length, Number(pagination.total) || state.journeys.length)
+    );
+    state.hasMoreJourneys = Boolean(pagination.hasMore)
+        && state.nextResultOffset < MAX_JOURNEYS;
     configureTransferFilter();
     renderAirlineFilters();
     elements.routeContext.textContent = `${request.origin.label || "Origin"} → ${request.destination.label || "Destination"}`;
-    if (!state.journeys.length) {
-        showEmpty(false);
+    if (!state.journeys.length && !append) {
+        showEmpty(selectedJourneyTypes().length > 0);
         return;
     }
     elements.resultsWorkspace.hidden = false;
@@ -373,13 +447,21 @@ function normalizeJourney(journey) {
 function configureTransferFilter() {
     const maximum = Math.max(0, ...state.journeys.map(journey => journey.numberOfTransfers));
     elements.maximumTransfers.max = String(maximum || 1);
-    elements.maximumTransfers.value = String(maximum || 1);
-    state.maximumTransferLimit = null;
+    if (state.maximumTransferLimit === null) {
+        elements.maximumTransfers.value = String(maximum || 1);
+    } else {
+        state.maximumTransferLimit = Math.min(state.maximumTransferLimit, maximum);
+        elements.maximumTransfers.value = String(state.maximumTransferLimit);
+    }
     updateMaximumTransfersLabel();
 }
 
 function renderAirlineFilters() {
-    const airlines = [...new Set(state.journeys.flatMap(journey => journey.airlines))]
+    const selectedAirlines = new Set(checkedValues('input[name="airline"]'));
+    const airlines = [...new Set([
+        ...state.journeys.flatMap(journey => journey.airlines),
+        ...selectedAirlines
+    ])]
         .sort((left, right) => left.localeCompare(right));
     elements.airlineFilters.replaceChildren();
     const fragment = document.createDocumentFragment();
@@ -390,6 +472,7 @@ function renderAirlineFilters() {
         input.type = "checkbox";
         input.name = "airline";
         input.value = airline;
+        input.checked = selectedAirlines.has(airline);
         const text = document.createElement("span");
         text.textContent = airline;
         label.append(input, text);
@@ -401,7 +484,6 @@ function renderAirlineFilters() {
 
 function applyFiltersAndSort() {
     if (!state.journeys.length) return;
-    const selectedTypes = checkedValues('input[name="journeyType"]');
     const selectedAirlines = checkedValues('input[name="airline"]');
     const departureAfter = timeToMinutes(elements.departureAfter.value);
     const departureBefore = timeToMinutes(elements.departureBefore.value);
@@ -413,7 +495,6 @@ function applyFiltersAndSort() {
     state.visibleJourneys = state.journeys.filter(journey => {
         if (state.quickFilter === "fastest" && journey.totalJourneyMinutes !== fastestDuration) return false;
         if (state.quickFilter === "fewest" && journey.numberOfTransfers !== fewestTransfers) return false;
-        if (selectedTypes.length && !selectedTypes.some(type => matchesJourneyType(journey, type))) return false;
         if (state.maximumTransferLimit !== null
             && journey.numberOfTransfers > state.maximumTransferLimit) return false;
         if (!withinTimeRange(journey.departureMinute, departureAfter, departureBefore)) return false;
@@ -423,19 +504,8 @@ function applyFiltersAndSort() {
         return true;
     });
     state.visibleJourneys.sort(sortComparator(elements.sortBy.value));
-    state.renderedCount = PAGE_SIZE;
     renderActiveFilters();
     renderJourneyCards();
-}
-
-function matchesJourneyType(journey, type) {
-    if (type === "RAIL_ONLY") return journey.modeSequence.length > 0
-        && journey.modeSequence.every(mode => mode === "RAIL");
-    if (type === "FLIGHT_ONLY") return journey.modeSequence.length > 0
-        && journey.modeSequence.every(mode => mode === "FLIGHT");
-    if (type === "RAIL_TO_FLIGHT") return hasTransition(journey.modeSequence, "RAIL", "FLIGHT");
-    if (type === "FLIGHT_TO_RAIL") return hasTransition(journey.modeSequence, "FLIGHT", "RAIL");
-    return true;
 }
 
 function hasTransition(sequence, from, to) {
@@ -455,10 +525,19 @@ function sortComparator(sortBy) {
 function renderJourneyCards() {
     elements.journeyResults.replaceChildren();
     const count = state.visibleJourneys.length;
-    elements.resultCount.textContent = count === state.journeys.length
-        ? `${count} ${pluralize(count, "journey", "journeys")} found`
-        : `${count} of ${state.journeys.length} journeys match your filters`;
+    const loadedCount = state.journeys.length;
+    elements.resultCount.textContent = count === loadedCount
+        ? state.hasMoreJourneys
+            ? `${loadedCount} of ${state.totalJourneyCount} journeys loaded`
+            : `${loadedCount} ${pluralize(loadedCount, "journey", "journeys")} found`
+        : `${count} of ${loadedCount} loaded journeys match your filters`;
     if (!count) {
+        if (state.hasMoreJourneys) {
+            elements.resultsWorkspace.hidden = false;
+            elements.emptyState.hidden = true;
+            renderShowMoreButton();
+            return;
+        }
         elements.resultsWorkspace.hidden = true;
         showEmpty(true);
         return;
@@ -467,13 +546,21 @@ function renderJourneyCards() {
     elements.emptyState.hidden = true;
     const fragment = document.createDocumentFragment();
     const fastest = Math.min(...state.journeys.map(item => item.totalJourneyMinutes));
-    for (const journey of state.visibleJourneys.slice(0, state.renderedCount)) {
+    for (const journey of state.visibleJourneys) {
         fragment.appendChild(createJourneyCard(journey, fastest));
     }
     elements.journeyResults.appendChild(fragment);
-    elements.showMoreButton.hidden = state.renderedCount >= count;
+    renderShowMoreButton();
+}
+
+function renderShowMoreButton() {
+    const remaining = Math.max(
+        0,
+        Math.min(state.totalJourneyCount, MAX_JOURNEYS) - state.nextResultOffset
+    );
+    elements.showMoreButton.hidden = !state.hasMoreJourneys || remaining === 0;
+    elements.showMoreButton.disabled = false;
     if (!elements.showMoreButton.hidden) {
-        const remaining = count - state.renderedCount;
         elements.showMoreButton.textContent = `Show ${Math.min(PAGE_SIZE, remaining)} more journeys`;
     }
 }
@@ -551,8 +638,8 @@ function toggleJourneyDetails(event) {
 }
 
 function renderTimeline(journey) {
-    const legs = journey.legs;
-    const last = legs[legs.length - 1];
+    const legs = journey.legs.filter(isVisibleJourneyLeg);
+    const last = journey.legs[journey.legs.length - 1];
     return `
         <div class="detail-title">
             <h3>Complete journey</h3>
@@ -567,6 +654,18 @@ function renderTimeline(journey) {
                     <div class="arrival-place">Arrive at ${escapeHtml(placeLabel(last.to, "destination"))}</div>
                 </div>` : ""}
         </div>`;
+}
+
+function isVisibleJourneyLeg(leg) {
+    if (leg.mode !== "LOCAL") return true;
+    const durationMinutes = Number(leg.durationMinutes);
+    const roadDistanceKm = Number(leg.estimatedRoadDistanceKm);
+    return !(
+        Number.isFinite(durationMinutes)
+        && durationMinutes <= 0
+        && Number.isFinite(roadDistanceKm)
+        && roadDistanceKm <= 0
+    );
 }
 
 function renderLeg(leg) {
@@ -692,10 +791,12 @@ function toggleQuickFilter(filter) {
 }
 
 function clearFilters() {
+    const hadJourneyTypeFilter = selectedJourneyTypes().length > 0;
     resetFilterControls();
     configureTransferFilter();
-    applyFiltersAndSort();
     closeFilters();
+    if (hadJourneyTypeFilter && state.lastRequest) submitSearch(state.lastRequest);
+    else applyFiltersAndSort();
 }
 
 function resetFilterControls() {
@@ -741,6 +842,7 @@ function removeFilterFromChip(event) {
     const button = event.target.closest("[data-filter-key]");
     if (!button) return;
     const key = button.dataset.filterKey;
+    let serverFilterChanged = false;
     if (key === "quick") {
         state.quickFilter = null;
         document.querySelectorAll("[data-quick-filter]").forEach(item => item.setAttribute("aria-pressed", "false"));
@@ -751,6 +853,7 @@ function removeFilterFromChip(event) {
     } else if (key.startsWith("type:")) {
         const input = document.querySelector(`input[name="journeyType"][value="${cssEscape(key.slice(5))}"]`);
         if (input) input.checked = false;
+        serverFilterChanged = true;
     } else if (key.startsWith("airline:")) {
         const value = key.slice(8);
         [...document.querySelectorAll('input[name="airline"]')]
@@ -758,7 +861,8 @@ function removeFilterFromChip(event) {
     } else if (elements[key]) {
         elements[key].value = "";
     }
-    applyFiltersAndSort();
+    if (serverFilterChanged && state.lastRequest) submitSearch(state.lastRequest);
+    else applyFiltersAndSort();
 }
 
 function updateMaximumTransfersLabel() {
@@ -769,6 +873,10 @@ function updateMaximumTransfersLabel() {
 
 function checkedValues(selector) {
     return [...document.querySelectorAll(`${selector}:checked`)].map(input => input.value);
+}
+
+function selectedJourneyTypes() {
+    return checkedValues('input[name="journeyType"]');
 }
 
 function withinTimeRange(value, after, before) {

@@ -14,6 +14,7 @@ const {
 } = require("../dist/repositories/multimodal-routing.repository");
 const {
     compareMultimodalJourneyResults,
+    selectMultimodalJourneyResults,
     searchMultimodalJourneys
 } = require("../dist/services/multimodal-journey.service");
 
@@ -47,8 +48,82 @@ test("multimodal search applies bounded phase-one defaults", () => {
     assert.equal(result.options.sourceRailRadiusKm, 200);
     assert.equal(result.options.sourceAirportRadiusKm, 300);
     assert.equal(result.options.maximumTransfers, undefined);
+    assert.equal(result.options.journeyTypes, undefined);
+    assert.equal(result.options.resultOffset, undefined);
+    assert.equal(result.options.pageSize, undefined);
     assert.equal(result.options.resultLimit, 50);
     assert.equal(result.departureAt, "2026-09-07");
+});
+
+test("multimodal search accepts server-side journey type filters", () => {
+    const result = parseMultimodalSearch({
+        origin: { latitude: 30.3165, longitude: 78.0322 },
+        destination: { latitude: 23.0225, longitude: 72.5714 },
+        departureAt: "2026-09-07",
+        options: { journeyTypes: ["RAIL_ONLY", "RAIL_TO_FLIGHT"] }
+    });
+    assert.deepEqual(result.options.journeyTypes, ["RAIL_ONLY", "RAIL_TO_FLIGHT"]);
+});
+
+test("multimodal search accepts bounded server-side pagination", () => {
+    const result = parseMultimodalSearch({
+        origin: { latitude: 30.3165, longitude: 78.0322 },
+        destination: { latitude: 23.0225, longitude: 72.5714 },
+        departureAt: "2026-09-07",
+        options: { resultOffset: 20, pageSize: 20, resultLimit: 50 }
+    });
+    assert.equal(result.options.resultOffset, 20);
+    assert.equal(result.options.pageSize, 20);
+    assert.equal(result.options.resultLimit, 50);
+});
+
+test("multimodal search rejects pagination beyond the UI bounds", () => {
+    assert.throws(() => parseMultimodalSearch({
+        origin: { latitude: 30.3165, longitude: 78.0322 },
+        destination: { latitude: 23.0225, longitude: 72.5714 },
+        departureAt: "2026-09-07",
+        options: { resultOffset: 50, pageSize: 21, resultLimit: 51 }
+    }));
+});
+
+test("multimodal search rejects unknown journey type filters", () => {
+    assert.throws(() => parseMultimodalSearch({
+        origin: { latitude: 30.3165, longitude: 78.0322 },
+        destination: { latitude: 23.0225, longitude: 72.5714 },
+        departureAt: "2026-09-07",
+        options: { journeyTypes: ["TRAIN"] }
+    }));
+});
+
+test("cached multimodal candidates are filtered and reranked per request", () => {
+    const result = (id, journeyType, modes, minutes) => ({
+        id,
+        rank: 0,
+        journeyType,
+        departureHub: {},
+        arrivalHub: {},
+        departureAt: "2026-09-15T00:00:00.000+05:30",
+        finalArrivalAt: "2026-09-15T12:00:00.000+05:30",
+        totalJourneyMinutes: minutes,
+        numberOfTransfers: 0,
+        scheduledLegs: modes.length,
+        modes: [...new Set(modes)],
+        legs: modes.map(mode => ({ mode }))
+    });
+    const candidates = [
+        result("flight", "FLIGHT_ONLY", ["FLIGHT"], 300),
+        result("rail", "RAIL_ONLY", ["RAIL"], 400),
+        result("mixed", "MIXED", ["RAIL", "FLIGHT"], 500)
+    ];
+
+    const selected = selectMultimodalJourneyResults(
+        candidates,
+        ["RAIL_ONLY", "RAIL_TO_FLIGHT"],
+        10
+    );
+
+    assert.deepEqual(selected.map(item => item.id), ["rail", "mixed"]);
+    assert.deepEqual(selected.map(item => item.rank), [1, 2]);
 });
 
 test("multimodal ranking prefers practicality over raw duration alone", () => {
