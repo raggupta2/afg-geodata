@@ -1,8 +1,8 @@
 "use strict";
 
 const API_URL = window.APP_CONFIG?.API_URL || "/api/v1/";
-const PAGE_SIZE = 20;
-const MAX_JOURNEYS = 50;
+const PAGE_SIZE = 5;
+const MAX_JOURNEYS = 20;
 const SCHEDULED_MODES = new Set(["RAIL", "FLIGHT"]);
 const mobileFilterMedia = window.matchMedia("(max-width: 780px)");
 
@@ -18,7 +18,8 @@ const state = {
     requestSequence: 0,
     quickFilter: null,
     maximumTransferLimit: null,
-    timeZone: "Asia/Kolkata"
+    timeZone: "Asia/Kolkata",
+    addressSessionTokens: { origin: null, destination: null }
 };
 
 const elements = {};
@@ -29,7 +30,9 @@ function initialize() {
     for (const id of [
         "journeySearchForm", "originLabel", "originLatitude", "originLongitude",
         "originSuggestions", "destinationLabel", "destinationLatitude",
-        "destinationLongitude", "destinationSuggestions", "departureAt",
+        "destinationLongitude", "destinationSuggestions",
+        "originAddressLabel", "originAddressSuggestions",
+        "destinationAddressLabel", "destinationAddressSuggestions", "departureAt",
         "searchButton", "useLocationButton", "swapLocationsButton", "formError",
         "resultsWorkspace", "filterPanel", "filterBackdrop", "openFiltersButton",
         "closeFiltersButton", "maximumTransfers", "maximumTransfersValue",
@@ -44,6 +47,8 @@ function initialize() {
     setDefaultDeparture();
     setupAutocomplete("origin");
     setupAutocomplete("destination");
+    setupAddressAutocomplete("origin");
+    setupAddressAutocomplete("destination");
     bindEvents();
 }
 
@@ -54,7 +59,9 @@ function bindEvents() {
     });
     elements.useLocationButton.addEventListener("click", useCurrentLocation);
     elements.swapLocationsButton.addEventListener("click", swapLocations);
-    elements.sortBy.addEventListener("change", applyFiltersAndSort);
+    elements.sortBy.addEventListener("change", () => {
+        if (state.lastRequest) submitSearch(state.lastRequest);
+    });
     elements.maximumTransfers.addEventListener("input", () => {
         state.maximumTransferLimit = Number(elements.maximumTransfers.value);
         updateMaximumTransfersLabel();
@@ -96,10 +103,13 @@ function apiUrl(path) {
 }
 
 function setDefaultDeparture() {
-    const today = new Date(Date.now() - new Date().getTimezoneOffset() * 60_000)
-        .toISOString().slice(0, 10);
-    elements.departureAt.value = today;
-    elements.departureAt.min = today;
+    const indiaNowMs = Date.now() + 330 * 60_000;
+    const minimum = new Date(indiaNowMs).toISOString().slice(0, 16);
+    const intervalMs = 15 * 60_000;
+    const roundedMs = Math.ceil(indiaNowMs / intervalMs) * intervalMs;
+    elements.departureAt.value = new Date(roundedMs)
+        .toISOString().slice(0, 16);
+    elements.departureAt.min = minimum;
 }
 
 function setupAutocomplete(prefix) {
@@ -123,7 +133,7 @@ function setupAutocomplete(prefix) {
             queryController = new AbortController();
             try {
                 const response = await fetch(
-                    apiUrl(`railways/stations?q=${encodeURIComponent(query)}&limit=10`),
+                    apiUrl(`railways/stations?q=${encodeURIComponent(query)}&limit=5`),
                     { signal: queryController.signal }
                 );
                 const body = await response.json();
@@ -212,7 +222,7 @@ function clearCoordinates(prefix) {
 }
 
 function swapLocations() {
-    for (const suffix of ["Label", "Latitude", "Longitude"]) {
+    for (const suffix of ["Label", "Latitude", "Longitude", "AddressLabel"]) {
         const origin = elements[`origin${suffix}`];
         const destination = elements[`destination${suffix}`];
         [origin.value, destination.value] = [destination.value, origin.value];
@@ -231,6 +241,7 @@ function useCurrentLocation() {
         elements.originLatitude.value = latitude;
         elements.originLongitude.value = longitude;
         elements.originLabel.value = "Current location";
+        elements.originAddressLabel.value = "Current location";
         elements.originLabel.removeAttribute("aria-invalid");
         elements.useLocationButton.disabled = false;
         elements.useLocationButton.innerHTML = '<span aria-hidden="true">⌖</span> Use my location';
@@ -242,7 +253,9 @@ function useCurrentLocation() {
             const body = await response.json();
             const nearest = body.data?.features?.[0];
             if (response.ok && body.success && nearest) {
-                elements.originLabel.value = `${stationLabel(nearest)} area`;
+                const currentLocationLabel = `${stationLabel(nearest)} area`;
+                elements.originLabel.value = currentLocationLabel;
+                elements.originAddressLabel.value = currentLocationLabel;
             }
         } catch {
             // Exact coordinates remain usable when the readable-name lookup fails.
@@ -252,6 +265,137 @@ function useCurrentLocation() {
         elements.useLocationButton.innerHTML = '<span aria-hidden="true">⌖</span> Use my location';
         showFormError(error.message || "Your current location could not be read.");
     }, { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 });
+}
+
+function ensureAddressSessionToken(target) {
+    if (!state.addressSessionTokens[target]) {
+        state.addressSessionTokens[target] = crypto.randomUUID();
+    }
+    return state.addressSessionTokens[target];
+}
+
+function setupAddressAutocomplete(target) {
+    const prefix = `${target}Address`;
+    const input = elements[`${prefix}Label`];
+    const list = elements[`${prefix}Suggestions`];
+    let timer = null;
+    let activeIndex = -1;
+    let suggestionController = null;
+    let requestSequence = 0;
+
+    input.addEventListener("input", () => {
+        clearTimeout(timer);
+        clearCoordinates(target);
+        activeIndex = -1;
+        const query = input.value.trim();
+        if (query.length < 2) {
+            suggestionController?.abort();
+            closeSuggestions(input, list);
+            return;
+        }
+        timer = setTimeout(async () => {
+            suggestionController?.abort();
+            suggestionController = new AbortController();
+            const sequence = ++requestSequence;
+            try {
+                const response = await fetch(
+                    apiUrl(
+                        `places/autocomplete?input=${encodeURIComponent(query)}`
+                        + `&sessiontoken=${encodeURIComponent(ensureAddressSessionToken(target))}`
+                    ),
+                    { signal: suggestionController.signal }
+                );
+                const body = await response.json();
+                // A newer keystroke already superseded this request; ignore the
+                // stale response so it can't reopen a dropdown the user moved past.
+                if (sequence !== requestSequence) return;
+                if (!response.ok || !body.success) throw new Error();
+                renderAddressSuggestions(target, body.data || []);
+            } catch (error) {
+                if (error.name !== "AbortError") closeSuggestions(input, list);
+            }
+        }, 300);
+    });
+
+    input.addEventListener("keydown", event => {
+        const options = [...list.querySelectorAll("li")];
+        if (!options.length) return;
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            activeIndex = event.key === "ArrowDown"
+                ? (activeIndex + 1) % options.length
+                : (activeIndex - 1 + options.length) % options.length;
+            options.forEach((option, index) =>
+                option.setAttribute("aria-selected", String(index === activeIndex))
+            );
+            options[activeIndex].scrollIntoView({ block: "nearest" });
+        } else if (event.key === "Enter" && activeIndex >= 0) {
+            event.preventDefault();
+            options[activeIndex].dispatchEvent(new MouseEvent("mousedown"));
+        } else if (event.key === "Escape") {
+            closeSuggestions(input, list);
+        }
+    });
+    input.addEventListener("blur", () =>
+        setTimeout(() => closeSuggestions(input, list), 140)
+    );
+}
+
+function renderAddressSuggestions(target, suggestions) {
+    const prefix = `${target}Address`;
+    const input = elements[`${prefix}Label`];
+    const list = elements[`${prefix}Suggestions`];
+    list.replaceChildren();
+
+    if (!suggestions.length) {
+        closeSuggestions(input, list);
+        return;
+    }
+
+    const fragment = document.createDocumentFragment();
+    for (const suggestion of suggestions) {
+        const item = document.createElement("li");
+        item.setAttribute("role", "option");
+        item.setAttribute("aria-selected", "false");
+        item.innerHTML = `<strong>${escapeHtml(suggestion.mainText)}</strong>`
+            + (suggestion.secondaryText
+                ? `<small>${escapeHtml(suggestion.secondaryText)}</small>`
+                : "");
+        item.addEventListener("mousedown", event => {
+            event.preventDefault();
+            selectAddress(target, suggestion);
+        });
+        fragment.appendChild(item);
+    }
+    list.appendChild(fragment);
+    list.classList.add("is-open");
+    input.setAttribute("aria-expanded", "true");
+}
+
+async function selectAddress(target, suggestion) {
+    const prefix = `${target}Address`;
+    const input = elements[`${prefix}Label`];
+    const list = elements[`${prefix}Suggestions`];
+    closeSuggestions(input, list);
+    input.value = suggestion.description;
+
+    try {
+        const response = await fetch(apiUrl(
+            `places/details?placeId=${encodeURIComponent(suggestion.placeId)}`
+            + `&sessiontoken=${encodeURIComponent(ensureAddressSessionToken(target))}`
+        ));
+        const body = await response.json();
+        if (!response.ok || !body.success) throw new Error();
+
+        elements[`${target}Latitude`].value = body.data.latitude;
+        elements[`${target}Longitude`].value = body.data.longitude;
+        elements[`${target}Label`].value = body.data.formattedAddress;
+        elements[`${target}Label`].removeAttribute("aria-invalid");
+        // The session is complete; the next search starts a fresh billing session.
+        state.addressSessionTokens[target] = null;
+    } catch {
+        showFormError("Couldn't load the selected address. Please try again.");
+    }
 }
 
 function validateAndBuildRequest() {
@@ -266,9 +410,10 @@ function validateAndBuildRequest() {
         label.setAttribute("aria-invalid", String(!hasCoordinates));
         if (!hasCoordinates) valid = false;
     }
-    const departureDate = elements.departureAt.value;
-    const hasDeparture = /^\d{4}-\d{2}-\d{2}$/.test(departureDate)
-        && Number.isFinite(Date.parse(`${departureDate}T00:00:00+05:30`));
+    const departureLocal = elements.departureAt.value;
+    const departureAt = `${departureLocal}:00+05:30`;
+    const hasDeparture = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(departureLocal)
+        && Number.isFinite(Date.parse(departureAt));
     elements.departureAt.setAttribute("aria-invalid", String(!hasDeparture));
     if (!hasDeparture) valid = false;
     if (!valid) {
@@ -287,11 +432,12 @@ function validateAndBuildRequest() {
             longitude: Number(elements.destinationLongitude.value),
             label: elements.destinationLabel.value.trim() || undefined
         },
-        departureAt: departureDate,
+        departureAt,
         options: {
             resultOffset: 0,
             pageSize: PAGE_SIZE,
-            resultLimit: MAX_JOURNEYS
+            resultLimit: MAX_JOURNEYS,
+            sortBy: elements.sortBy.value
         }
     };
 }
@@ -299,7 +445,9 @@ function validateAndBuildRequest() {
 async function submitSearch(existingRequest = null) {
     const baseRequest = existingRequest || validateAndBuildRequest();
     if (!baseRequest) return;
-    const request = withJourneyTypeFilter(withJourneyPage(baseRequest, 0));
+    const request = withServerSort(
+        withJourneyTypeFilter(withJourneyPage(baseRequest, 0))
+    );
     state.lastRequest = request;
     state.abortController?.abort();
     state.abortController = new AbortController();
@@ -371,6 +519,16 @@ function withJourneyPage(request, resultOffset) {
             resultOffset,
             pageSize: PAGE_SIZE,
             resultLimit: MAX_JOURNEYS
+        }
+    };
+}
+
+function withServerSort(request) {
+    return {
+        ...request,
+        options: {
+            ...request.options,
+            sortBy: elements.sortBy.value
         }
     };
 }
@@ -503,23 +661,12 @@ function applyFiltersAndSort() {
             && !selectedAirlines.some(airline => journey.airlines.includes(airline))) return false;
         return true;
     });
-    state.visibleJourneys.sort(sortComparator(elements.sortBy.value));
     renderActiveFilters();
     renderJourneyCards();
 }
 
 function hasTransition(sequence, from, to) {
     return sequence.some((mode, index) => mode === from && sequence[index + 1] === to);
-}
-
-function sortComparator(sortBy) {
-    const tieBreak = (left, right) => left.arrivalMs - right.arrivalMs
-        || left.totalJourneyMinutes - right.totalJourneyMinutes
-        || left.numberOfTransfers - right.numberOfTransfers;
-    if (sortBy === "departure") return (left, right) => left.departureMs - right.departureMs || tieBreak(left, right);
-    if (sortBy === "arrival") return (left, right) => left.arrivalMs - right.arrivalMs || left.numberOfTransfers - right.numberOfTransfers;
-    if (sortBy === "transfers") return (left, right) => left.numberOfTransfers - right.numberOfTransfers || tieBreak(left, right);
-    return (left, right) => left.totalJourneyMinutes - right.totalJourneyMinutes || tieBreak(left, right);
 }
 
 function renderJourneyCards() {
@@ -792,10 +939,13 @@ function toggleQuickFilter(filter) {
 
 function clearFilters() {
     const hadJourneyTypeFilter = selectedJourneyTypes().length > 0;
+    const hadNonDefaultSort = elements.sortBy.value !== "transfers";
     resetFilterControls();
     configureTransferFilter();
     closeFilters();
-    if (hadJourneyTypeFilter && state.lastRequest) submitSearch(state.lastRequest);
+    if ((hadJourneyTypeFilter || hadNonDefaultSort) && state.lastRequest) {
+        submitSearch(state.lastRequest);
+    }
     else applyFiltersAndSort();
 }
 
@@ -811,7 +961,7 @@ function resetFilterControls() {
         elements.departureAfter, elements.departureBefore,
         elements.arrivalAfter, elements.arrivalBefore
     ]) input.value = "";
-    elements.sortBy.value = "duration";
+    elements.sortBy.value = "transfers";
 }
 
 function renderActiveFilters() {

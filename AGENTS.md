@@ -1,5 +1,16 @@
 # AGENTS.md
 
+## Durable Project Memory
+
+Before changing or investigating this repository, read
+`PROJECT_MEMORY.md`. It records user requirements, established findings,
+implementation decisions, and verification status from earlier conversations.
+Read `CONVERSATION_MEMORY.md` when the exact user-request chronology or the
+Claude Code handoff context is needed.
+Update it when a conversation establishes new durable project knowledge. Keep
+it concise and factual; never store credentials, secrets, hidden reasoning, or
+large raw command output.
+
 ## Project Context
 
 `afg-geodata` implements a **multimodal journey search engine** (Road + Railway + Flight) using **TypeScript**, **Prisma**, **PostgreSQL**, and **PostGIS**.

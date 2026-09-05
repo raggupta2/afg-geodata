@@ -42,7 +42,7 @@ const requestBody = {
         destinationCandidateLimit: 4,
         boardingStationLimit: 4,
         routesPerBoardingStation: 2,
-        resultLimit: 8
+        resultLimit: 5
     }
 };
 
@@ -73,6 +73,17 @@ test("journey search applies coordinate-search defaults", () => {
     assert.equal(result.options.sourceCandidateLimit, 6);
     assert.equal(result.options.destinationCandidateLimit, 4);
     assert.equal(result.options.boardingStationLimit, 5);
+    assert.equal(result.options.resultLimit, 5);
+    assert.equal(result.options.sortBy, "transfers");
+});
+
+test("journey search rejects more than five results", () => {
+    assert.throws(() => parseJourneySearch({
+        origin: requestBody.origin,
+        destination: requestBody.destination,
+        departureAt: requestBody.departureAt,
+        options: { ...requestBody.options, resultLimit: 6 }
+    }));
 });
 
 test("journey search accepts a date without inventing a departure time", () => {
@@ -83,6 +94,19 @@ test("journey search accepts a date without inventing a departure time", () => {
     });
     assert.equal(result.departureDate, "2026-08-04");
     assert.equal(result.departureAt, undefined);
+});
+
+test("journey search validates the departure date and time", () => {
+    assert.throws(() => parseJourneySearch({
+        origin: requestBody.origin,
+        destination: requestBody.destination,
+        departureAt: "2026-02-30T08:00:00+05:30"
+    }));
+    assert.throws(() => parseJourneySearch({
+        origin: requestBody.origin,
+        destination: requestBody.destination,
+        departureAt: "2026-08-04T08:00"
+    }));
 });
 
 test("station access keeps aerial and estimated road distance separate", async () => {
@@ -201,10 +225,12 @@ test("coordinate search returns ranked nearby-station journeys", async () => {
     assert.equal(response.status, 200);
     assert.equal(body.success, true);
     assert.ok(body.count > 0);
+    assert.ok(body.count <= 5);
     assert.ok(body.data.boardingStations.length >= 2);
     assert.ok(body.data.boardingStations.length <= 4);
     assert.equal(body.data.assumptions.aerialDistanceMethod, "POSTGIS_GEODESIC");
     assert.equal(body.data.request.timeZone, "Asia/Kolkata");
+    assert.equal(body.data.request.sortBy, "transfers");
 
     const first = body.data.trainResults[0];
     assert.equal(first.rank, 1);
@@ -237,10 +263,12 @@ test("coordinate search returns ranked nearby-station journeys", async () => {
         body.data.trainResults.length
     );
     for (let index = 1; index < body.data.trainResults.length; index += 1) {
-        assert.ok(
-            body.data.trainResults[index - 1].totalJourneyMinutes
-                <= body.data.trainResults[index].totalJourneyMinutes
-        );
+        const previous = body.data.trainResults[index - 1];
+        const current = body.data.trainResults[index];
+        assert.ok(previous.numberOfTransfers <= current.numberOfTransfers);
+        if (previous.numberOfTransfers === current.numberOfTransfers) {
+            assert.ok(previous.totalJourneyMinutes <= current.totalJourneyMinutes);
+        }
     }
     assert.ok(body.data.trainResults.every(
         option => option.overallScoreMinutes === option.totalJourneyMinutes
@@ -268,7 +296,7 @@ test("date-only search includes the direct HW to LMNR train", async () => {
                 destinationCandidateLimit: 4,
                 boardingStationLimit: 6,
                 routesPerBoardingStation: 5,
-                resultLimit: 30
+                resultLimit: 5
             }
         })
     });

@@ -3,8 +3,13 @@ const getApiUrl = path =>
     `${API_URL.replace(/\/?$/, "/")}${path.replace(/^\//, "")}`;
 
 document.addEventListener("DOMContentLoaded", () => {
-    document.getElementById("departureDate").value =
-        new Date().toISOString().slice(0, 10);
+    const indiaNowMs = Date.now() + 330 * 60_000;
+    const intervalMs = 15 * 60_000;
+    const departureInput = document.getElementById("departureDate");
+    departureInput.value = new Date(
+        Math.ceil(indiaNowMs / intervalMs) * intervalMs
+    ).toISOString().slice(0, 16);
+    departureInput.min = new Date(indiaNowMs).toISOString().slice(0, 16);
 
     setupStationAutocomplete("origin");
     setupStationAutocomplete("destination");
@@ -45,7 +50,7 @@ async function loadStationSuggestions(prefix, query) {
     try {
         const response = await fetch(
             getApiUrl(
-                `railways/stations?q=${encodeURIComponent(query)}&limit=10`
+                `railways/stations?q=${encodeURIComponent(query)}&limit=5`
             )
         );
         const body = await response.json();
@@ -150,17 +155,18 @@ async function loadRoutes() {
     const originLongitude = numberValue("originLongitude");
     const destinationLatitude = numberValue("destinationLatitude");
     const destinationLongitude = numberValue("destinationLongitude");
-    const departureDate = document.getElementById("departureDate").value;
+    const departureLocal = document.getElementById("departureDate").value;
+    const departureAt = `${departureLocal}:00+05:30`;
 
     if (
         originLatitude === null
         || originLongitude === null
         || destinationLatitude === null
         || destinationLongitude === null
-        || !departureDate
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(departureLocal)
     ) {
         result.innerHTML =
-            '<div class="error">Select an origin and destination, then choose a departure date.</div>';
+            '<div class="error">Select an origin and destination, then choose a departure date and time.</div>';
         return;
     }
 
@@ -183,7 +189,7 @@ async function loadRoutes() {
                     label: document.getElementById("destinationLabel").value
                         || undefined
                 },
-                departureDate
+                departureAt
             })
         });
         const body = await response.json();

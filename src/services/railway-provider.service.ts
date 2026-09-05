@@ -3,6 +3,7 @@ import { ApiError } from "../errors/api.error";
 import { BoundedAsyncTtlCache } from "../cache/bounded-async-ttl-cache";
 import { findAllActiveJourneyConnections } from "../repositories/railway-routing.repository";
 import { JourneyConnection, JourneyStation } from "../types/railway-journey";
+import { JourneySortOrder } from "../types/journey-search";
 import {
     railwayRunsOnDay,
     RailwayOperatingDay
@@ -18,7 +19,11 @@ type RailwayGraphSnapshot = {
     version: string;
     expiresAt: number;
     boardingsByStation: Map<string, TrainBoarding[]>;
-    connections: JourneyConnection[];
+    connectionsByTrain: Map<string, JourneyConnection[]>;
+    alightingsByStation: Map<string, Array<{
+        trainId: string;
+        sequence: number;
+    }>>;
     minimumLegsCache: Map<string, Map<string, number>>;
 };
 
@@ -70,6 +75,7 @@ export type RailwayRideExpansion = {
 type SearchLimits = {
     maxResults: number;
     latestOriginDepartureMinute?: number;
+    sortBy: JourneySortOrder;
 };
 
 export type RailwayRoutingLimits = {
@@ -166,19 +172,43 @@ function operatingDay(date: Date): RailwayOperatingDay {
     return WEEKDAYS[date.getUTCDay()];
 }
 
-function buildTrainBoardings(
+function buildConnectionIndexes(
     connections: JourneyConnection[]
-): Map<string, TrainBoarding[]> {
+): Pick<
+    RailwayGraphSnapshot,
+    "connectionsByTrain" | "alightingsByStation"
+> {
     const byTrain = new Map<string, JourneyConnection[]>();
+    const alightings: RailwayGraphSnapshot["alightingsByStation"] = new Map();
     for (const connection of connections) {
         const trainConnections = byTrain.get(connection.trainId) ?? [];
         trainConnections.push(connection);
         byTrain.set(connection.trainId, trainConnections);
+        if (connection.alightingAllowed) {
+            const stationAlightings = alightings.get(
+                connection.toStation.id
+            ) ?? [];
+            stationAlightings.push({
+                trainId: connection.trainId,
+                sequence: connection.sequence
+            });
+            alightings.set(connection.toStation.id, stationAlightings);
+        }
     }
+    for (const trainConnections of byTrain.values()) {
+        trainConnections.sort((left, right) => left.sequence - right.sequence);
+    }
+    return {
+        connectionsByTrain: byTrain,
+        alightingsByStation: alightings
+    };
+}
 
+function buildTrainBoardings(
+    byTrain: Map<string, JourneyConnection[]>
+): Map<string, TrainBoarding[]> {
     const boardingsByStation = new Map<string, TrainBoarding[]>();
     for (const [trainId, trainConnections] of byTrain) {
-        trainConnections.sort((left, right) => left.sequence - right.sequence);
         for (
             let startIndex = 0;
             startIndex < trainConnections.length;
@@ -202,12 +232,13 @@ function buildTrainBoardings(
 
 async function loadGraphSnapshot(): Promise<RailwayGraphSnapshot> {
     const connections = await findAllActiveJourneyConnections();
+    const indexes = buildConnectionIndexes(connections);
     const loadedAt = new Date();
     return {
         version: `${loadedAt.toISOString()}:${connections.length}`,
         expiresAt: Date.now() + SNAPSHOT_TTL_MS,
-        boardingsByStation: buildTrainBoardings(connections),
-        connections,
+        boardingsByStation: buildTrainBoardings(indexes.connectionsByTrain),
+        ...indexes,
         minimumLegsCache: new Map()
     };
 }
@@ -295,7 +326,10 @@ function findMinimumRemainingLegs(
     destinationStationIds: Set<string>,
     maxTrainLegs: number
 ): Map<string, number> {
-    const cacheKey = [...destinationStationIds].sort().join("|");
+    const cacheKey = [
+        maxTrainLegs,
+        ...[...destinationStationIds].sort()
+    ].join("|");
     const cached = snapshot.minimumLegsCache.get(cacheKey);
     if (cached) {
         snapshot.minimumLegsCache.delete(cacheKey);
@@ -303,53 +337,46 @@ function findMinimumRemainingLegs(
         return cached;
     }
 
-    const byTrain = new Map<string, JourneyConnection[]>();
-    for (const connection of snapshot.connections) {
-        const trainConnections = byTrain.get(connection.trainId) ?? [];
-        trainConnections.push(connection);
-        byTrain.set(connection.trainId, trainConnections);
-    }
-
     const minimumLegs = new Map<string, number>(
         [...destinationStationIds].map(stationId => [stationId, 0])
     );
-    for (let iteration = 0; iteration < maxTrainLegs; iteration += 1) {
-        let changed = false;
-        for (const trainConnections of byTrain.values()) {
-            let bestDownstreamLegs: number | undefined;
-            for (
-                let index = trainConnections.length - 1;
-                index >= 0;
-                index -= 1
-            ) {
-                const connection = trainConnections[index];
-                const downstreamLegs = minimumLegs.get(
-                    connection.toStation.id
-                );
-                if (
-                    connection.alightingAllowed
-                    && downstreamLegs !== undefined
-                    && (
-                        bestDownstreamLegs === undefined
-                        || downstreamLegs < bestDownstreamLegs
-                    )
-                ) {
-                    bestDownstreamLegs = downstreamLegs;
-                }
-                if (
-                    connection.boardingAllowed
-                    && bestDownstreamLegs !== undefined
-                ) {
-                    const candidate = bestDownstreamLegs + 1;
-                    const known = minimumLegs.get(connection.fromStation.id);
-                    if (known === undefined || candidate < known) {
-                        minimumLegs.set(connection.fromStation.id, candidate);
-                        changed = true;
+    let frontier = new Set(destinationStationIds);
+    const expandedSequenceByTrain = new Map<string, number>();
+    for (
+        let legCount = 1;
+        legCount <= maxTrainLegs && frontier.size > 0;
+        legCount += 1
+    ) {
+        const nextFrontier = new Set<string>();
+        for (const stationId of frontier) {
+            const alightings = snapshot.alightingsByStation.get(stationId) ?? [];
+            for (const alighting of alightings) {
+                const previousSequence = expandedSequenceByTrain.get(
+                    alighting.trainId
+                ) ?? 0;
+                if (alighting.sequence <= previousSequence) continue;
+                const trainConnections = snapshot.connectionsByTrain.get(
+                    alighting.trainId
+                ) ?? [];
+                for (const connection of trainConnections) {
+                    if (connection.sequence > alighting.sequence) break;
+                    if (
+                        connection.sequence <= previousSequence
+                        || !connection.boardingAllowed
+                        || minimumLegs.has(connection.fromStation.id)
+                    ) {
+                        continue;
                     }
+                    minimumLegs.set(connection.fromStation.id, legCount);
+                    nextFrontier.add(connection.fromStation.id);
                 }
+                expandedSequenceByTrain.set(
+                    alighting.trainId,
+                    alighting.sequence
+                );
             }
         }
-        if (!changed) break;
+        frontier = nextFrontier;
     }
 
     snapshot.minimumLegsCache.set(cacheKey, minimumLegs);
@@ -372,16 +399,40 @@ function journeyKey(state: JourneySearchState): string {
 }
 
 function trainSequenceKey(state: JourneySearchState): string {
+    const services = state.rides.map(ride => {
+        const first = ride[0];
+        return `${first.trainNumber}@${first.serviceDate ?? ""}`;
+    });
+    const transfers = state.rides.slice(0, -1).map((ride, index) => {
+        const nextRide = state.rides[index + 1];
+        return `${ride[ride.length - 1].toStation.id}>${nextRide[0].fromStation.id}`;
+    });
     return [
-        state.originStationId,
-        ...state.rides.map(ride => ride[0].trainId)
+        state.rides.length === 1 ? "DIRECT" : "TRANSFER",
+        ...services,
+        ...transfers
     ].join("|");
 }
 
 function compareStates(
     left: JourneySearchState,
-    right: JourneySearchState
+    right: JourneySearchState,
+    sortBy: JourneySortOrder
 ): number {
+    if (sortBy === "transfers") {
+        return left.estimatedTotalLegs - right.estimatedTotalLegs
+            || left.arrivalMinute - right.arrivalMinute
+            || left.rides.length - right.rides.length;
+    }
+    if (sortBy === "departure") {
+        const leftDeparture = left.rides[0]?.[0]?.departureMinute
+            ?? left.arrivalMinute;
+        const rightDeparture = right.rides[0]?.[0]?.departureMinute
+            ?? right.arrivalMinute;
+        return leftDeparture - rightDeparture
+            || left.arrivalMinute - right.arrivalMinute
+            || left.estimatedTotalLegs - right.estimatedTotalLegs;
+    }
     return left.arrivalMinute - right.arrivalMinute
         || left.estimatedTotalLegs - right.estimatedTotalLegs
         || left.rides.length - right.rides.length;
@@ -389,6 +440,8 @@ function compareStates(
 
 class JourneySearchQueue {
     private readonly states: JourneySearchState[] = [];
+
+    constructor(private readonly sortBy: JourneySortOrder) {}
 
     get length(): number {
         return this.states.length;
@@ -402,7 +455,8 @@ class JourneySearchQueue {
             if (
                 compareStates(
                     this.states[parentIndex],
-                    this.states[index]
+                    this.states[index],
+                    this.sortBy
                 ) <= 0
             ) {
                 break;
@@ -430,7 +484,8 @@ class JourneySearchQueue {
                 leftIndex < this.states.length
                 && compareStates(
                     this.states[leftIndex],
-                    this.states[smallest]
+                    this.states[smallest],
+                    this.sortBy
                 ) < 0
             ) {
                 smallest = leftIndex;
@@ -439,7 +494,8 @@ class JourneySearchQueue {
                 rightIndex < this.states.length
                 && compareStates(
                     this.states[rightIndex],
-                    this.states[smallest]
+                    this.states[smallest],
+                    this.sortBy
                 ) < 0
             ) {
                 smallest = rightIndex;
@@ -517,13 +573,15 @@ async function searchEarliestPaths(
     maxResultsPerOrigin: number,
     resultKeys: Set<string>,
     trainKeys: Set<string>,
-    limits: RailwayRoutingLimits
+    limits: RailwayRoutingLimits,
+    latestOriginDepartureMinute: number | undefined,
+    sortBy: JourneySortOrder
 ): Promise<{
     paths: RailwayPath[];
     truncated: boolean;
     reason: string | null;
 }> {
-    const queue = new JourneySearchQueue();
+    const queue = new JourneySearchQueue(sortBy);
     const labels = new Map<string, JourneySearchState[]>();
     const reachableOriginIds = new Set<string>();
     for (const origin of origins) {
@@ -622,6 +680,13 @@ async function searchEarliestPaths(
                 limits.searchHorizonDays
             );
             if (!occurrence) continue;
+            if (
+                state.rides.length === 0
+                && latestOriginDepartureMinute !== undefined
+                && occurrence[0].departureMinute >= latestOriginDepartureMinute
+            ) {
+                continue;
+            }
 
             const ride: JourneyConnection[] = [];
             for (const connection of occurrence) {
@@ -892,6 +957,41 @@ function findDirectPaths(
     return { paths, originsWithoutDirectPaths };
 }
 
+function pathTransferCount(path: RailwayPath): number {
+    return Math.max(
+        0,
+        new Set(path.connections.map(connection => connection.trainId)).size - 1
+    );
+}
+
+function comparePaths(
+    left: RailwayPath,
+    right: RailwayPath,
+    sortBy: JourneySortOrder
+): number {
+    const transferDifference = pathTransferCount(left)
+        - pathTransferCount(right);
+    const durationDifference = (left.arrivalMinute - left.departureMinute)
+        - (right.arrivalMinute - right.departureMinute);
+    const arrivalDifference = left.arrivalMinute - right.arrivalMinute;
+    if (sortBy === "duration") {
+        return durationDifference || transferDifference || arrivalDifference;
+    }
+    if (sortBy === "departure") {
+        return left.departureMinute - right.departureMinute
+            || transferDifference || arrivalDifference;
+    }
+    if (sortBy === "arrival") {
+        return arrivalDifference || transferDifference || durationDifference;
+    }
+    return transferDifference || arrivalDifference || durationDifference;
+}
+
+function directServiceKey(path: RailwayPath): string {
+    const first = path.connections[0];
+    return `DIRECT|${first.trainNumber}@${first.serviceDate ?? ""}`;
+}
+
 async function executeSearch(
     origins: RailwaySearchOrigin[],
     destinationStationIds: Set<string>,
@@ -904,90 +1004,60 @@ async function executeSearch(
         2,
         Math.ceil(limits.maxResults / origins.length)
     );
-    const direct = findDirectPaths(
-        snapshot,
-        origins,
-        destinationStationIds,
-        requestedDate,
-        maxResultsPerOrigin,
-        routingLimits.searchHorizonDays,
-        limits.latestOriginDepartureMinute
-    );
-    const paths: RailwayPath[] = [...direct.paths];
-    const roundBasedPaths = await searchRoundBasedPaths(
-        snapshot,
-        origins,
-        destinationStationIds,
-        requestedDate,
-        routingLimits,
-        limits.latestOriginDepartureMinute
-    );
-    paths.push(...roundBasedPaths);
-
-    paths.sort((left, right) =>
-        left.arrivalMinute - right.arrivalMinute
-        || left.connections[0].trainId.localeCompare(
-            right.connections[0].trainId
-        )
-    );
-    const deduplicatedPaths: RailwayPath[] = [];
-    const pathKeys = new Set<string>();
-    for (const path of paths) {
-        const key = [
-            path.originStationId,
-            path.destinationStationId,
-            path.departureMinute,
-            path.arrivalMinute,
-            ...path.connections.map(connection => connection.trainId)
-        ].join(":");
-        if (pathKeys.has(key)) continue;
-        pathKeys.add(key);
-        deduplicatedPaths.push(path);
-    }
-    const diversifiedPaths: RailwayPath[] = [];
-    const selectedPathKeys = new Set<string>();
-    const pathCountByOrigin = new Map<string, number>();
-    const directDestinationKeys = new Set<string>();
-
-    for (const path of deduplicatedPaths) {
-        const trainIds = new Set(
-            path.connections.map(connection => connection.trainId)
+    const directPaths: RailwayPath[] = [];
+    const trainKeys = new Set<string>();
+    // An arrival-ordered cutoff can fill all five slots with connections before
+    // a later direct service is popped. Resolve direct services first when the
+    // requested primary key is transfer count, then fill only the open slots.
+    if (limits.sortBy === "transfers") {
+        const direct = findDirectPaths(
+            snapshot,
+            origins,
+            destinationStationIds,
+            requestedDate,
+            limits.maxResults,
+            routingLimits.searchHorizonDays,
+            limits.latestOriginDepartureMinute
+        ).paths.sort((left, right) =>
+            comparePaths(left, right, limits.sortBy)
         );
-        if (trainIds.size !== 1) continue;
-        const destinationKey =
-            `${path.originStationId}:${path.destinationStationId}`;
-        if (directDestinationKeys.has(destinationKey)) continue;
-        const count = pathCountByOrigin.get(path.originStationId) ?? 0;
-        if (count >= maxResultsPerOrigin) continue;
-        directDestinationKeys.add(destinationKey);
-        pathCountByOrigin.set(path.originStationId, count + 1);
-        diversifiedPaths.push(path);
-        selectedPathKeys.add([
-            path.originStationId,
-            path.destinationStationId,
-            path.departureMinute,
-            path.arrivalMinute,
-            ...path.connections.map(connection => connection.trainId)
-        ].join(":"));
+        for (const path of direct) {
+            const key = directServiceKey(path);
+            if (trainKeys.has(key)) continue;
+            trainKeys.add(key);
+            directPaths.push(path);
+            if (directPaths.length >= limits.maxResults) break;
+        }
+        if (directPaths.length >= limits.maxResults) {
+            return {
+                graphVersion: snapshot.version,
+                paths: directPaths,
+                searchComplete: true,
+                truncationReason: null
+            };
+        }
     }
-
-    for (const path of deduplicatedPaths) {
-        const pathKey = [
-            path.originStationId,
-            path.destinationStationId,
-            path.departureMinute,
-            path.arrivalMinute,
-            ...path.connections.map(connection => connection.trainId)
-        ].join(":");
-        if (selectedPathKeys.has(pathKey)) continue;
-        const count = pathCountByOrigin.get(path.originStationId) ?? 0;
-        if (count >= maxResultsPerOrigin) continue;
-        pathCountByOrigin.set(path.originStationId, count + 1);
-        diversifiedPaths.push(path);
-        selectedPathKeys.add(pathKey);
-    }
-    diversifiedPaths.sort((left, right) =>
-        left.arrivalMinute - right.arrivalMinute
+    const minimumRemainingLegs = findMinimumRemainingLegs(
+        snapshot,
+        destinationStationIds,
+        routingLimits.maxTrainLegs
+    );
+    const search = await searchEarliestPaths(
+        snapshot,
+        minimumRemainingLegs,
+        origins,
+        destinationStationIds,
+        requestedDate,
+        limits.maxResults - directPaths.length,
+        maxResultsPerOrigin,
+        new Set<string>(),
+        trainKeys,
+        routingLimits,
+        limits.latestOriginDepartureMinute,
+        limits.sortBy
+    );
+    const paths = [...directPaths, ...search.paths].sort((left, right) =>
+        comparePaths(left, right, limits.sortBy)
         || left.connections[0].trainId.localeCompare(
             right.connections[0].trainId
         )
@@ -995,9 +1065,9 @@ async function executeSearch(
 
     return {
         graphVersion: snapshot.version,
-        paths: diversifiedPaths,
-        searchComplete: true,
-        truncationReason: null
+        paths,
+        searchComplete: !search.truncated,
+        truncationReason: search.reason
     };
 }
 
@@ -1007,7 +1077,8 @@ export async function searchRailwayProvider(
     requestedDate: Date,
     maxResults: number,
     routingLimits: RailwayRoutingLimits,
-    latestOriginDepartureMinute?: number
+    latestOriginDepartureMinute?: number,
+    sortBy: JourneySortOrder = "transfers"
 ): Promise<RailwayProviderResult> {
     if (origins.length === 0 || destinationStationIds.size === 0) {
         return {
@@ -1028,6 +1099,7 @@ export async function searchRailwayProvider(
         [...destinationStationIds].sort().join(","),
         maxResults,
         latestOriginDepartureMinute ?? "none",
+        sortBy,
         routingLimits.minimumRailTransferMinutes,
         routingLimits.maxTrainLegs,
         routingLimits.searchHorizonDays
@@ -1039,7 +1111,7 @@ export async function searchRailwayProvider(
                 origins,
                 destinationStationIds,
                 requestedDate,
-                { maxResults, latestOriginDepartureMinute },
+                { maxResults, latestOriginDepartureMinute, sortBy },
                 routingLimits
             )
         )

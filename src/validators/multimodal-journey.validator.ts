@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ApiError } from "../errors/api.error";
+import { JOURNEY_RESULT_LIMIT } from "../types/journey-search";
 import { MultimodalSearchInput } from "../types/multimodal-journey";
 
 const coordinates = z.object({
@@ -17,9 +18,21 @@ function isCalendarDate(value: string): boolean {
         && date.getUTCDate() === day;
 }
 
+function isOffsetDateTime(value: string): boolean {
+    const match = value.match(
+        /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/i
+    );
+    return match !== null
+        && isCalendarDate(match[1])
+        && Number.isFinite(Date.parse(value));
+}
+
 const departureAt = z.string().trim().refine(
-    isCalendarDate,
-    "departureAt must be a valid calendar date in YYYY-MM-DD format."
+    value => isCalendarDate(value) || isOffsetDateTime(value),
+    "departureAt must be a valid calendar date or an ISO datetime with Z or a UTC offset."
+).transform(value => isCalendarDate(value)
+    ? `${value}T00:00:00+05:30`
+    : value
 );
 
 const options = z.object({
@@ -37,8 +50,20 @@ const options = z.object({
     ])).min(1).max(4).optional(),
     resultOffset: z.number().int().min(0).max(49).optional(),
     pageSize: z.number().int().min(1).max(20).optional(),
-    resultLimit: z.number().int().min(1).max(50).default(50)
-}).strict();
+    resultLimit: z.number().int().min(1).max(50)
+        .default(JOURNEY_RESULT_LIMIT),
+    sortBy: z.enum(["transfers", "duration", "departure", "arrival"])
+        .default("transfers")
+}).strict().transform(value => ({
+    ...value,
+    resultOffset: value.resultOffset === undefined
+        ? undefined
+        : Math.min(value.resultOffset, JOURNEY_RESULT_LIMIT),
+    pageSize: value.pageSize === undefined
+        ? undefined
+        : Math.min(value.pageSize, JOURNEY_RESULT_LIMIT),
+    resultLimit: Math.min(value.resultLimit, JOURNEY_RESULT_LIMIT)
+}));
 
 const schema = z.object({
     origin: coordinates,

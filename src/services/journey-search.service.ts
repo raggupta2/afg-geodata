@@ -13,6 +13,8 @@ import {
     JourneyLeg,
     JourneyPlace,
     JourneySearchInput,
+    JourneySortOrder,
+    JOURNEY_RESULT_LIMIT,
     JourneySearchOption,
     JourneySearchResult,
     JourneyTrainResult,
@@ -183,9 +185,12 @@ function buildOption(
     destination: NearbyRailwayStation,
     request: JourneySearchInput,
     clock: RailwaySearchClock,
-    policy: JourneyRoutingPolicy
+    policy: JourneyRoutingPolicy,
+    departureAtIsTrainThreshold = false
 ): JourneySearchOption {
     const dateOnlySearch = request.departureDate !== undefined;
+    const flexibleOriginTiming = dateOnlySearch
+        || departureAtIsTrainThreshold;
     const sourceStation = publicCandidate(source.station);
     const destinationStation = publicCandidate(destination);
     const sourcePlace = stationPlace(sourceStation);
@@ -215,15 +220,15 @@ function buildOption(
         0,
         railwayElapsedMinutes - trainInVehicleMinutes
     );
-    const sourceDepartureMinute = dateOnlySearch
+    const sourceDepartureMinute = flexibleOriginTiming
         ? path.departureMinute
             - policy.initialRailBufferMinutes
             - source.roadTravelMinutes
         : clock.requestedMinute;
-    const stationArrivalMinute = dateOnlySearch
+    const stationArrivalMinute = flexibleOriginTiming
         ? path.departureMinute - policy.initialRailBufferMinutes
         : source.stationArrivalMinute;
-    const readyMinute = dateOnlySearch
+    const readyMinute = flexibleOriginTiming
         ? path.departureMinute
         : source.readyMinute;
     const sourceDepartureInstant = minuteToInstant(
@@ -361,7 +366,7 @@ function buildOption(
         railwayElapsedMinutes,
         trainInVehicleMinutes,
         railTransferWaitingMinutes,
-        totalJourneyMinutes: dateOnlySearch
+        totalJourneyMinutes: flexibleOriginTiming
             ? source.roadTravelMinutes
                 + policy.initialRailBufferMinutes
                 + railwayElapsedMinutes
@@ -382,15 +387,28 @@ function railLegs(option: JourneySearchOption): RailJourneyLeg[] {
 
 function compareJourneyOptions(
     left: JourneySearchOption,
-    right: JourneySearchOption
+    right: JourneySearchOption,
+    sortBy: JourneySortOrder = "transfers"
 ): number {
-    return left.totalJourneyMinutes - right.totalJourneyMinutes
-        || left.numberOfTransfers - right.numberOfTransfers
+    const tieBreak = left.numberOfTransfers - right.numberOfTransfers
+        || left.totalJourneyMinutes - right.totalJourneyMinutes
         || left.sourceAccess.travelMinutes - right.sourceAccess.travelMinutes
         || left.preTrainWaitingMinutes - right.preTrainWaitingMinutes
         || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt)
         || left.railTransferWaitingMinutes
             - right.railTransferWaitingMinutes;
+    if (sortBy === "duration") {
+        return left.totalJourneyMinutes - right.totalJourneyMinutes || tieBreak;
+    }
+    if (sortBy === "departure") {
+        return Date.parse(left.firstTrainDepartureAt)
+            - Date.parse(right.firstTrainDepartureAt) || tieBreak;
+    }
+    if (sortBy === "arrival") {
+        return Date.parse(left.finalArrivalAt)
+            - Date.parse(right.finalArrivalAt) || tieBreak;
+    }
+    return left.numberOfTransfers - right.numberOfTransfers || tieBreak;
 }
 
 function itineraryKey(option: JourneySearchOption): string {
@@ -487,7 +505,8 @@ type GroupedJourney = {
 };
 
 function groupJourneyOptions(
-    options: JourneySearchOption[]
+    options: JourneySearchOption[],
+    sortBy: JourneySortOrder
 ): GroupedJourney[] {
     const grouped = new Map<string, JourneySearchOption[]>();
     for (const option of options) {
@@ -499,7 +518,9 @@ function groupJourneyOptions(
 
     const results: GroupedJourney[] = [];
     for (const [key, groupOptions] of grouped) {
-        groupOptions.sort(compareJourneyOptions);
+        groupOptions.sort((left, right) =>
+            compareJourneyOptions(left, right, sortBy)
+        );
         const recommended = groupOptions[0];
         const trains = trainSummaries(recommended);
         const availableTrainDistances = trains
@@ -561,7 +582,7 @@ function groupJourneyOptions(
         });
     }
     return results.sort((left, right) =>
-        compareJourneyOptions(left.options[0], right.options[0])
+        compareJourneyOptions(left.options[0], right.options[0], sortBy)
     );
 }
 
@@ -647,7 +668,8 @@ function additionalTrainStations(
 }
 
 async function executeCoordinateRailwayJourneySearch(
-    request: JourneySearchInput
+    request: JourneySearchInput,
+    departureAtIsTrainThreshold = false
 ): Promise<JourneySearchResult> {
     const dateOnlySearch = request.departureDate !== undefined;
     const clock = dateOnlySearch
@@ -694,7 +716,9 @@ async function executeCoordinateRailwayJourneySearch(
             const stationArrivalMinute =
                 dateOnlySearch
                     ? 0
-                    : clock.requestedMinute + access.travelMinutes;
+                    : departureAtIsTrainThreshold
+                        ? clock.requestedMinute
+                        : clock.requestedMinute + access.travelMinutes;
             return {
                 station,
                 roadTravelMinutes: access.travelMinutes,
@@ -702,7 +726,9 @@ async function executeCoordinateRailwayJourneySearch(
                 stationArrivalMinute,
                 readyMinute: dateOnlySearch
                     ? 0
-                    : stationArrivalMinute + policy.initialRailBufferMinutes
+                    : departureAtIsTrainThreshold
+                        ? clock.requestedMinute
+                        : stationArrivalMinute + policy.initialRailBufferMinutes
             };
         }
     );
@@ -712,14 +738,6 @@ async function executeCoordinateRailwayJourneySearch(
     const destinationById = new Map(
         destinationStations.map(station => [station.id, station])
     );
-    const internalResultLimit = Math.min(
-        60,
-        Math.max(
-            request.options.resultLimit * 2,
-            sourceStations.length
-                * request.options.routesPerBoardingStation
-        )
-    );
     const providerResult = await searchRailwayProvider(
         sourceTimings.map(source => ({
             stationId: source.station.id,
@@ -727,9 +745,10 @@ async function executeCoordinateRailwayJourneySearch(
         })),
         new Set(destinationStations.map(station => station.id)),
         clock.serviceDate,
-        internalResultLimit,
+        request.options.resultLimit,
         routingLimits,
-        dateOnlySearch ? 24 * 60 : undefined
+        dateOnlySearch ? 24 * 60 : undefined,
+        request.options.sortBy
     );
 
     const allOptions = providerResult.paths
@@ -739,20 +758,27 @@ async function executeCoordinateRailwayJourneySearch(
                 path.destinationStationId
             );
             return source && destination
-                ? buildOption(path, source, destination, request, clock, policy)
+                ? buildOption(
+                    path,
+                    source,
+                    destination,
+                    request,
+                    clock,
+                    policy,
+                    departureAtIsTrainThreshold
+                )
                 : null;
         })
         .filter((option): option is JourneySearchOption => option !== null)
         .sort((left, right) =>
-            left.totalJourneyMinutes - right.totalJourneyMinutes
-            || left.numberOfTransfers - right.numberOfTransfers
+            compareJourneyOptions(left, right, request.options.sortBy)
             || right.boardingStation.activeTrainCount
                 - left.boardingStation.activeTrainCount
-            || left.sourceAccess.travelMinutes
-                - right.sourceAccess.travelMinutes
-            || left.preTrainWaitingMinutes - right.preTrainWaitingMinutes
         );
-    const groupedJourneys = groupJourneyOptions(allOptions);
+    const groupedJourneys = groupJourneyOptions(
+        allOptions,
+        request.options.sortBy
+    );
     const selectedGroups = groupedJourneys.slice(
         0,
         request.options.resultLimit
@@ -772,6 +798,7 @@ async function executeCoordinateRailwayJourneySearch(
             departureAt: dateOnlySearch
                 ? null
                 : formatRailwayDateTime(clock.requestedInstant),
+            sortBy: request.options.sortBy,
             timeZone: RAILWAY_TIME_ZONE
         },
         assumptions: {
@@ -814,11 +841,45 @@ async function executeCoordinateRailwayJourneySearch(
 export async function searchCoordinateRailwayJourney(
     request: JourneySearchInput
 ): Promise<JourneySearchResult> {
+    const boundedRequest: JourneySearchInput = {
+        ...request,
+        options: {
+            ...request.options,
+            resultLimit: Math.min(
+                request.options.resultLimit,
+                JOURNEY_RESULT_LIMIT
+            ),
+            sortBy: request.options.sortBy ?? "transfers"
+        }
+    };
     const cacheKey = createHash("sha256")
-        .update(JSON.stringify(request))
+        .update(JSON.stringify(boundedRequest))
         .digest("hex");
     return journeyResultCache.getOrLoad(
         cacheKey,
-        () => executeCoordinateRailwayJourneySearch(request)
+        () => executeCoordinateRailwayJourneySearch(boundedRequest)
+    );
+}
+
+export async function searchCoordinateRailwayDeparturesAfter(
+    request: JourneySearchInput
+): Promise<JourneySearchResult> {
+    const boundedRequest: JourneySearchInput = {
+        ...request,
+        options: {
+            ...request.options,
+            resultLimit: Math.min(
+                request.options.resultLimit,
+                JOURNEY_RESULT_LIMIT
+            ),
+            sortBy: request.options.sortBy ?? "transfers"
+        }
+    };
+    const cacheKey = createHash("sha256")
+        .update(`train-departures-after:${JSON.stringify(boundedRequest)}`)
+        .digest("hex");
+    return journeyResultCache.getOrLoad(
+        cacheKey,
+        () => executeCoordinateRailwayJourneySearch(boundedRequest, true)
     );
 }

@@ -4,6 +4,22 @@ export type Coordinates = {
     label?: string;
 };
 
+// Ceiling for a paginated journey search across all pages (see resultOffset /
+// pageSize on MultimodalSearchInput). The UI pages through this five at a
+// time via "Show more"; this is the total window, not the per-page size.
+export const JOURNEY_RESULT_LIMIT = 20;
+
+// The direct coordinate railway search (/railways/search, used by the
+// train-schedule page) has no "Show more" pagination UI, so it keeps its own
+// smaller single-page cap independent of JOURNEY_RESULT_LIMIT above.
+export const RAILWAY_DIRECT_SEARCH_RESULT_LIMIT = 5;
+
+export type JourneySortOrder =
+    | "transfers"
+    | "duration"
+    | "departure"
+    | "arrival";
+
 export type JourneySearchOptions = {
     sourceRadiusKm: number;
     destinationRadiusKm: number;
@@ -12,6 +28,7 @@ export type JourneySearchOptions = {
     boardingStationLimit: number;
     routesPerBoardingStation: number;
     resultLimit: number;
+    sortBy: JourneySortOrder;
 };
 
 type JourneySearchBase = {
@@ -201,6 +218,7 @@ export type JourneySearchResult = {
         searchMode: "DATE_ONLY" | "DATE_TIME";
         departureDate: string;
         departureAt: string | null;
+        sortBy: JourneySortOrder;
         timeZone: string;
     };
     assumptions: {

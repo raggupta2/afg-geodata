@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { ApiError } from "../errors/api.error";
 import {
+    RAILWAY_DIRECT_SEARCH_RESULT_LIMIT,
     JourneySearchInput,
     JourneySearchOptions
 } from "../types/journey-search";
@@ -11,14 +12,6 @@ const coordinateSchema = z.object({
     label: z.string().trim().min(1).max(150).optional()
 }).strict();
 
-const offsetDateTimeSchema = z.string()
-    .trim()
-    .refine(
-        value => /(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
-            && Number.isFinite(Date.parse(value)),
-        "departureAt must be a valid ISO datetime with Z or a UTC offset."
-    );
-
 function isCalendarDate(value: string): boolean {
     const [year, month, day] = value.split("-").map(Number);
     const date = new Date(Date.UTC(year, month - 1, day));
@@ -26,6 +19,22 @@ function isCalendarDate(value: string): boolean {
         && date.getUTCMonth() === month - 1
         && date.getUTCDate() === day;
 }
+
+function isOffsetDateTime(value: string): boolean {
+    const match = value.match(
+        /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/i
+    );
+    return match !== null
+        && isCalendarDate(match[1])
+        && Number.isFinite(Date.parse(value));
+}
+
+const offsetDateTimeSchema = z.string()
+    .trim()
+    .refine(
+        isOffsetDateTime,
+        "departureAt must be a valid ISO datetime with Z or a UTC offset."
+    );
 
 const dateSchema = z.string()
     .trim()
@@ -39,7 +48,10 @@ const optionSchema = z.object({
     destinationCandidateLimit: z.number().int().min(1).max(15).default(4),
     boardingStationLimit: z.number().int().min(1).max(10).default(5),
     routesPerBoardingStation: z.number().int().min(1).max(5).default(3),
-    resultLimit: z.number().int().min(1).max(30).default(20)
+    resultLimit: z.number().int().min(1).max(RAILWAY_DIRECT_SEARCH_RESULT_LIMIT)
+        .default(RAILWAY_DIRECT_SEARCH_RESULT_LIMIT),
+    sortBy: z.enum(["transfers", "duration", "departure", "arrival"])
+        .default("transfers")
 }).strict();
 
 const searchSchema = z.object({

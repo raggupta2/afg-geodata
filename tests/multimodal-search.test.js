@@ -10,10 +10,12 @@ const {
 const {
     findNearbyRoutingHubs,
     loadFlightInstances,
-    loadRoutingHubs
+    loadRoutingHubs,
+    loadTransferLinks
 } = require("../dist/repositories/multimodal-routing.repository");
 const {
     compareMultimodalJourneyResults,
+    isRailOnlyJourneyTypeSelection,
     selectMultimodalJourneyResults,
     searchMultimodalJourneys
 } = require("../dist/services/multimodal-journey.service");
@@ -43,7 +45,7 @@ test("multimodal search applies bounded phase-one defaults", () => {
     const result = parseMultimodalSearch({
         origin: { latitude: 30.3165, longitude: 78.0322 },
         destination: { latitude: 23.0225, longitude: 72.5714 },
-        departureAt: "2026-09-07"
+        departureAt: "2026-09-07T08:00:00+05:30"
     });
     assert.equal(result.options.sourceRailRadiusKm, 200);
     assert.equal(result.options.sourceAirportRadiusKm, 300);
@@ -51,51 +53,77 @@ test("multimodal search applies bounded phase-one defaults", () => {
     assert.equal(result.options.journeyTypes, undefined);
     assert.equal(result.options.resultOffset, undefined);
     assert.equal(result.options.pageSize, undefined);
-    assert.equal(result.options.resultLimit, 50);
-    assert.equal(result.departureAt, "2026-09-07");
+    assert.equal(result.options.resultLimit, 20);
+    assert.equal(result.options.sortBy, "transfers");
+    assert.equal(result.departureAt, "2026-09-07T08:00:00+05:30");
 });
 
 test("multimodal search accepts server-side journey type filters", () => {
     const result = parseMultimodalSearch({
         origin: { latitude: 30.3165, longitude: 78.0322 },
         destination: { latitude: 23.0225, longitude: 72.5714 },
-        departureAt: "2026-09-07",
+        departureAt: "2026-09-07T08:00:00+05:30",
         options: { journeyTypes: ["RAIL_ONLY", "RAIL_TO_FLIGHT"] }
     });
     assert.deepEqual(result.options.journeyTypes, ["RAIL_ONLY", "RAIL_TO_FLIGHT"]);
+});
+
+test("multimodal search accepts server-side sorting", () => {
+    const result = parseMultimodalSearch({
+        origin: { latitude: 22.7196, longitude: 75.8577 },
+        destination: { latitude: 32.7266, longitude: 74.857 },
+        departureAt: "2026-09-07T08:00:00+05:30",
+        options: { sortBy: "arrival" }
+    });
+    assert.equal(result.options.sortBy, "arrival");
 });
 
 test("multimodal search accepts bounded server-side pagination", () => {
     const result = parseMultimodalSearch({
         origin: { latitude: 30.3165, longitude: 78.0322 },
         destination: { latitude: 23.0225, longitude: 72.5714 },
-        departureAt: "2026-09-07",
-        options: { resultOffset: 20, pageSize: 20, resultLimit: 50 }
+        departureAt: "2026-09-07T08:00:00+05:30",
+        options: { resultOffset: 2, pageSize: 3, resultLimit: 5 }
+    });
+    assert.equal(result.options.resultOffset, 2);
+    assert.equal(result.options.pageSize, 3);
+    assert.equal(result.options.resultLimit, 5);
+});
+
+test("multimodal search clamps legacy pagination to twenty results", () => {
+    const result = parseMultimodalSearch({
+        origin: { latitude: 30.3165, longitude: 78.0322 },
+        destination: { latitude: 23.0225, longitude: 72.5714 },
+        departureAt: "2026-09-07T08:00:00+05:30",
+        options: { resultOffset: 40, pageSize: 20, resultLimit: 50 }
     });
     assert.equal(result.options.resultOffset, 20);
     assert.equal(result.options.pageSize, 20);
-    assert.equal(result.options.resultLimit, 50);
-});
-
-test("multimodal search rejects pagination beyond the UI bounds", () => {
-    assert.throws(() => parseMultimodalSearch({
-        origin: { latitude: 30.3165, longitude: 78.0322 },
-        destination: { latitude: 23.0225, longitude: 72.5714 },
-        departureAt: "2026-09-07",
-        options: { resultOffset: 50, pageSize: 21, resultLimit: 51 }
-    }));
+    assert.equal(result.options.resultLimit, 20);
 });
 
 test("multimodal search rejects unknown journey type filters", () => {
     assert.throws(() => parseMultimodalSearch({
         origin: { latitude: 30.3165, longitude: 78.0322 },
         destination: { latitude: 23.0225, longitude: 72.5714 },
-        departureAt: "2026-09-07",
+        departureAt: "2026-09-07T08:00:00+05:30",
         options: { journeyTypes: ["TRAIN"] }
     }));
 });
 
-test("cached multimodal candidates are filtered and reranked per request", () => {
+test("only an exclusive train-only filter uses the rail fast path", () => {
+    assert.equal(isRailOnlyJourneyTypeSelection(["RAIL_ONLY"]), true);
+    assert.equal(isRailOnlyJourneyTypeSelection(["FLIGHT_ONLY"]), false);
+    assert.equal(isRailOnlyJourneyTypeSelection(["RAIL_TO_FLIGHT"]), false);
+    assert.equal(isRailOnlyJourneyTypeSelection(["FLIGHT_TO_RAIL"]), false);
+    assert.equal(
+        isRailOnlyJourneyTypeSelection(["RAIL_ONLY", "FLIGHT_ONLY"]),
+        false
+    );
+    assert.equal(isRailOnlyJourneyTypeSelection(undefined), false);
+});
+
+test("multimodal candidates are filtered, limited, and reranked", () => {
     const result = (id, journeyType, modes, minutes) => ({
         id,
         rank: 0,
@@ -119,11 +147,45 @@ test("cached multimodal candidates are filtered and reranked per request", () =>
     const selected = selectMultimodalJourneyResults(
         candidates,
         ["RAIL_ONLY", "RAIL_TO_FLIGHT"],
-        10
+        5
     );
 
     assert.deepEqual(selected.map(item => item.id), ["rail", "mixed"]);
     assert.deepEqual(selected.map(item => item.rank), [1, 2]);
+});
+
+test("multimodal server sorting defaults to transfers and honors overrides", () => {
+    const candidate = (id, transfers, minutes) => ({
+        id,
+        rank: 0,
+        journeyType: transfers === 0 ? "RAIL_ONLY" : "MIXED",
+        departureHub: {},
+        arrivalHub: {},
+        departureAt: "2026-09-15T08:00:00+05:30",
+        finalArrivalAt: `2026-09-15T${transfers === 0 ? "20" : "16"}:00:00+05:30`,
+        totalJourneyMinutes: minutes,
+        numberOfTransfers: transfers,
+        scheduledLegs: transfers + 1,
+        modes: ["RAIL"],
+        legs: []
+    });
+    const direct = candidate("direct", 0, 720);
+    const transfer = candidate("transfer", 1, 480);
+
+    assert.deepEqual(
+        selectMultimodalJourneyResults([transfer, direct], undefined, 5)
+            .map(item => item.id),
+        ["direct", "transfer"]
+    );
+    assert.deepEqual(
+        selectMultimodalJourneyResults(
+            [transfer, direct],
+            undefined,
+            5,
+            "duration"
+        ).map(item => item.id),
+        ["transfer", "direct"]
+    );
 });
 
 test("multimodal ranking prefers practicality over raw duration alone", () => {
@@ -257,19 +319,28 @@ test("origin discovery can include every airport inside its configured radius", 
     assert.ok(airports.some(hub => hub.code === "DEL"));
 });
 
-test("multimodal search rejects an invalid calendar date", () => {
+test("multimodal search rejects an invalid calendar datetime", () => {
     assert.throws(() => parseMultimodalSearch({
         origin: { latitude: 30.3165, longitude: 78.0322 },
         destination: { latitude: 23.0225, longitude: 72.5714 },
-        departureAt: "2026-02-30"
+        departureAt: "2026-02-30T08:00:00+05:30"
     }));
 });
 
-test("multimodal search requires a date-only departureAt", () => {
+test("multimodal search normalizes a legacy date-only departure", () => {
+    const result = parseMultimodalSearch({
+        origin: { latitude: 30.3165, longitude: 78.0322 },
+        destination: { latitude: 23.0225, longitude: 72.5714 },
+        departureAt: "2026-09-07"
+    });
+    assert.equal(result.departureAt, "2026-09-07T00:00:00+05:30");
+});
+
+test("multimodal search requires an offset when a time is supplied", () => {
     assert.throws(() => parseMultimodalSearch({
         origin: { latitude: 30.3165, longitude: 78.0322 },
         destination: { latitude: 23.0225, longitude: 72.5714 },
-        departureAt: "2026-09-07T05:00:00+05:30"
+        departureAt: "2026-09-07T05:00"
     }));
 });
 
@@ -285,7 +356,7 @@ test("multimodal journey endpoint is registered and validates requests", async (
     assert.match(body.message, /multimodal journey search/i);
 });
 
-test("loadFlightInstances only returns scheduled-service airlines", async t => {
+test("loadFlightInstances applies time, service, and per-airport limits in SQL", async t => {
     const start = new Date("2026-09-18T00:00:00.000+05:30");
     const end = new Date("2026-09-21T00:00:00.000+05:30");
     const nonScheduledCount = await prisma.aviationAirline.count({
@@ -295,13 +366,25 @@ test("loadFlightInstances only returns scheduled-service airlines", async t => {
         t.skip("No non-scheduled airlines are present in this database.");
         return;
     }
-    const flights = await loadFlightInstances(start, end);
+    const flights = await loadFlightInstances(start, end, 5);
     if (flights.length === 0) {
         t.skip("No flight instances are present in this database for the window.");
         return;
     }
     assert.ok(flights.every(flight => flight.airline !== null));
     assert.ok(flights.every(flight => flight.airline.serviceType === "scheduled"));
+    assert.ok(flights.every(flight =>
+        flight.departureAt >= start && flight.departureAt <= end
+    ));
+    const countsByDepartureHub = new Map();
+    for (const flight of flights) {
+        const hubId = flight.departureAirport.hub.id.toString();
+        countsByDepartureHub.set(
+            hubId,
+            (countsByDepartureHub.get(hubId) ?? 0) + 1
+        );
+    }
+    assert.ok([...countsByDepartureHub.values()].every(count => count <= 5));
 });
 
 test("imported flight instances are domestic operating services", async t => {
@@ -358,18 +441,27 @@ test("DDN to DEL on 2026-09-18 ranks the direct DED flight ahead of rail-only ro
     const result = await searchMultimodalJourneys({
         origin: { latitude: 30.3143365, longitude: 78.0335573, label: "Dehradun" },
         destination: { latitude: 28.6419258, longitude: 77.2217499, label: "New Delhi" },
-        departureAt: "2026-09-18",
+        departureAt: "2026-09-18T00:00:00+05:30",
         options: {
             sourceRailRadiusKm: 200,
             sourceAirportRadiusKm: 300,
             destinationRailRadiusKm: 50,
             destinationAirportRadiusKm: 100,
             candidatesPerMode: 5,
-            resultLimit: 30
+            resultLimit: 5
         }
     });
 
+    assert.equal(
+        result.request.departureAt,
+        "2026-09-18T00:00:00+05:30"
+    );
+    assert.ok(result.journeyResults.every(journey =>
+        Date.parse(journey.departureAt)
+            >= Date.parse(result.request.departureAt)
+    ));
     const flightResults = result.journeyResults.filter(r => r.modes.includes("FLIGHT"));
+    assert.ok(result.journeyResults.length <= 5);
     assert.ok(
         flightResults.length > 0,
         `Expected at least one FLIGHT-inclusive result; got modes: ${result.journeyResults.map(r => r.journeyType).join(", ")}`
@@ -402,6 +494,49 @@ test("DDN to DEL on 2026-09-18 ranks the direct DED flight ahead of rail-only ro
     }
 });
 
+test("RAIL_ONLY returns departures after the requested time with server pagination", async () => {
+    const requestedDeparture = "2026-08-04T07:44:00+05:30";
+    const response = await fetch(`${baseUrl}/api/v1/journeys/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            origin: {
+                latitude: 30.34382480994622,
+                longitude: 78.04758895044175
+            },
+            destination: {
+                latitude: 22.719568,
+                longitude: 75.857727
+            },
+            departureAt: requestedDeparture,
+            options: {
+                journeyTypes: ["RAIL_ONLY"],
+                sortBy: "transfers",
+                resultOffset: 0,
+                pageSize: 2,
+                resultLimit: 5
+            }
+        })
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(body.success, true);
+    assert.ok(body.data.journeyResults.length <= 2);
+    assert.ok(body.data.journeyResults.length > 0);
+    assert.ok(body.data.journeyResults.every(journey => {
+        const firstTrain = journey.legs.find(leg => leg.mode === "RAIL");
+        return firstTrain
+            && Date.parse(firstTrain.departureAt)
+                >= Date.parse(requestedDeparture);
+    }));
+    assert.ok(body.data.journeyResults.some(journey =>
+        journey.legs.some(leg =>
+            leg.mode === "RAIL" && leg.serviceNumber === "14310"
+        )
+    ));
+});
+
 test("station-airport links are directional and use positive road estimates", async t => {
     const link = await prisma.hubTransferLink.findFirst({
         include: { fromHub: true, toHub: true }
@@ -413,4 +548,21 @@ test("station-airport links are directional and use positive road estimates", as
     assert.notEqual(link.fromHub.hubType, link.toHub.hubType);
     assert.ok(link.travelMinutes > 0);
     assert.ok(Number(link.estimatedRoadDistanceKm) >= Number(link.aerialDistanceKm));
+});
+
+test("transfer-link loading is capped per active source hub", async t => {
+    const links = await loadTransferLinks(3);
+    if (links.length === 0) {
+        t.skip("Hub transfers have not been generated in this database.");
+        return;
+    }
+    const countsBySourceHub = new Map();
+    for (const link of links) {
+        const hubId = link.fromHubId.toString();
+        countsBySourceHub.set(
+            hubId,
+            (countsBySourceHub.get(hubId) ?? 0) + 1
+        );
+    }
+    assert.ok([...countsBySourceHub.values()].every(count => count <= 3));
 });

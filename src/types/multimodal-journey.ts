@@ -1,4 +1,4 @@
-import { Coordinates } from "./journey-search";
+import { Coordinates, JourneySortOrder } from "./journey-search";
 
 export type JourneyTypeFilter =
     | "RAIL_ONLY"
@@ -21,6 +21,7 @@ export type MultimodalSearchInput = {
         resultOffset?: number;
         pageSize?: number;
         resultLimit: number;
+        sortBy: JourneySortOrder;
     };
 };
 
@@ -74,6 +75,7 @@ export type MultimodalSearchResult = {
         destination: Coordinates;
         departureAt: string;
         journeyTypes?: JourneyTypeFilter[];
+        sortBy: JourneySortOrder;
         timezone: "Asia/Kolkata";
     };
     policy: {

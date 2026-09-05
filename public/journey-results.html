@@ -30,9 +30,40 @@
             </div>
 
             <form id="journeySearchForm" class="search-form" novalidate>
-                <div class="location-fields">
+                 <div class="location-fields address-fields">
                     <div class="field autocomplete-field">
-                        <label for="originLabel">From</label>
+                        <label for="originAddressLabel">From <span class="label-hint">(address)</span></label>
+                        <div class="input-with-icon">
+                            <span class="field-icon origin-dot" aria-hidden="true"></span>
+                            <input id="originAddressLabel" name="originAddressLabel" type="search"
+                                placeholder="Street address, landmark, or locality" autocomplete="off"
+                                role="combobox" aria-autocomplete="list"
+                                aria-controls="originAddressSuggestions" aria-expanded="false">
+                        </div>
+                        <ul id="originAddressSuggestions" class="suggestions" role="listbox"></ul>
+                    </div>
+
+                    <button id="swapLocationsButton" class="swap-button" type="button"
+                        aria-label="Swap origin and destination" title="Swap locations">
+                        <span aria-hidden="true">⇄</span>
+                    </button>
+
+                    <div class="field autocomplete-field">
+                        <label for="destinationAddressLabel">To <span class="label-hint">(address)</span></label>
+                        <div class="input-with-icon">
+                            <span class="field-icon destination-dot" aria-hidden="true"></span>
+                            <input id="destinationAddressLabel" name="destinationAddressLabel" type="search"
+                                placeholder="Street address, landmark, or locality" autocomplete="off"
+                                role="combobox" aria-autocomplete="list"
+                                aria-controls="destinationAddressSuggestions" aria-expanded="false">
+                        </div>
+                        <ul id="destinationAddressSuggestions" class="suggestions" role="listbox"></ul>
+                    </div>
+                </div>
+                
+                <div class="location-fields is-hidden">
+                    <div class="field autocomplete-field">
+                        <label for="originLabel">From <span class="label-hint">(station)</span></label>
                         <div class="input-with-icon">
                             <span class="field-icon origin-dot" aria-hidden="true"></span>
                             <input id="originLabel" name="originLabel" type="search"
@@ -45,13 +76,10 @@
                         <input id="originLongitude" type="hidden">
                     </div>
 
-                    <button id="swapLocationsButton" class="swap-button" type="button"
-                        aria-label="Swap origin and destination" title="Swap locations">
-                        <span aria-hidden="true">⇄</span>
-                    </button>
+                    <span aria-hidden="true"></span>
 
                     <div class="field autocomplete-field">
-                        <label for="destinationLabel">To</label>
+                        <label for="destinationLabel">To <span class="label-hint">(station)</span></label>
                         <div class="input-with-icon">
                             <span class="field-icon destination-dot" aria-hidden="true"></span>
                             <input id="destinationLabel" name="destinationLabel" type="search"
@@ -65,9 +93,12 @@
                     </div>
                 </div>
 
+               
+
                 <div class="field date-field">
-                    <label for="departureAt">Depart</label>
-                    <input id="departureAt" name="departureAt" type="date" required>
+                    <label for="departureAt">Departure date and time</label>
+                    <input id="departureAt" name="departureAt"
+                        type="datetime-local" step="60" required>
                 </div>
 
                 <button id="searchButton" class="primary-button" type="submit">
@@ -172,10 +203,10 @@
                         <label class="sort-control" for="sortBy">
                             <span>Sort by</span>
                             <select id="sortBy">
+                                <option value="transfers">Number of transfers</option>
                                 <option value="duration">Total journey duration</option>
                                 <option value="departure">Departure time</option>
                                 <option value="arrival">Arrival time</option>
-                                <option value="transfers">Number of transfers</option>
                             </select>
                         </label>
                     </div>
