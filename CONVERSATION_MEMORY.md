@@ -1,6 +1,6 @@
 # Conversation Memory and Claude Code Handoff
 
-Last updated: 2026-09-05 (Asia/Calcutta)
+Last updated: 2026-09-08 (Asia/Calcutta)
 
 This is a normalized, durable record of the user-visible requests available in
 the current development conversation. It is designed for continuation in
@@ -204,36 +204,127 @@ nowhere else in the repo, so they were deleted outright. The backend
 `/places/*` API was deliberately **not** touched - it's what
 `journey-results.html`'s own address fields call.
 
+### 13. Which route-search algorithm is actually in use
+
+The user asked whether search used RAPTOR, CSA, or Dijkstra. Read-only trace
+of the live code path (not documentation, not naming conventions) found:
+railway search is Dijkstra/A\* depending on sort order; multimodal search is
+explicitly weighted A\* (per its own code comments); an unused,
+never-called, RAPTOR-shaped function exists in `railway-provider.service.ts`
+but is dead code. No changes made.
+
+### 14. Deeper, read-only performance-optimization plan
+
+The user asked to go one level deeper: a concrete optimization plan
+(file/function, current bottleneck, expected impact, correctness risk,
+benchmark method, P0/P1/P2 priority for each item), plus direct answers on
+whether the algorithm or the implementation was the bottleneck (the
+implementation - per-state allocation, not the algorithm family), the scale
+at which RAPTOR/CSA would become better, whether a hybrid made sense, the
+top 3 changes for the best risk/reward, and metrics to collect. Analysis
+only - explicitly told not to implement anything yet.
+
+### 15. Read-only concurrency/production-readiness audit
+
+The user asked for a read-only audit focused specifically on multiple
+concurrent users (1/5/10/25/50/100 concurrent searches), tracing every
+concurrency control, cache, DB connection path, and CPU/memory risk.
+Verdict: **CONDITIONAL** - the single biggest gap was that the multimodal
+endpoint had no admission control at all, unlike the railway endpoint's
+existing `SearchSemaphore`. Analysis only.
+
+### 16. Implement the audit's P0 fixes
+
+> Implement only the highest-priority production-safety fixes described
+> below.
+
+The user authorized implementation of exactly three items: bounded
+admission control for multimodal search (reusing/extracting the railway
+engine's `SearchSemaphore`), an explicit Prisma connection-pool size via
+`DATABASE_CONNECTION_LIMIT`, and a consistent `503` overload response -
+with tests, and an explicit list of things *not* to do (no algorithm
+rewrites, no Set/array optimization, no clustering, no Redis, in that
+round).
+
+### 17. Continue with the remaining P1/P2 items
+
+The user asked to continue with the audit's remaining improvements; asked
+which to do now via a clarifying question, and selected all four offered:
+HTTP rate limiting (in-process, no new dependency, per their explicit
+choice), metrics/observability, opt-in multi-process clustering, and the
+previously-deferred per-state allocation fixes (`Set`/array copies replaced
+with an immutable linked chain in both search engines) - the same fixes
+that were explicitly forbidden in request #16's round, now in scope because
+the user chose them. All four were implemented, with before/after
+`git stash` comparisons against the real dev database confirming the
+allocation fixes were behavior-preserving.
+
+### 18. Final production-readiness review
+
+The user asked for a final review covering rate limiting, clustering, DB
+limits, concurrency, and metrics; specifically to make sure
+`CLUSTER_WORKERS > 1` correctly accounts for per-worker capacity and rate
+limits; to document the env vars introduced across requests #16-17; to
+decide whether `/api/v1/health/metrics` needed protection; and to add tests
+only where genuinely needed without touching pre-existing real-data test
+failures or unrelated files (`places.service.ts`, the frontend
+`journey-results.*` files, which had picked up further unrelated edits by
+this point). The review found the per-worker multiplication was documented
+in code comments but not surfaced anywhere at runtime, and that the new
+metrics endpoint had no access control. Both were fixed (a cluster-startup
+warning log echoing actual configured values; optional
+`METRICS_ACCESS_TOKEN` gating, open-by-default with a startup warning), the
+duplicated rate-limiter config parsing across both route files was
+consolidated into one shared resolver, unit tests were added for the
+previously-uncovered rate-limiter and metrics/metrics-auth modules, and
+`docs/production-environment-variables.md` was written as the durable
+reference. Neither pre-existing test failure was touched.
+
 ## Current handoff state
 
-- The working tree has intentional uncommitted changes across validators,
-  journey services, the railway provider, repository queries, browser calendar
-  and sorting code, focused tests, and a pending Prisma index migration, now
-  extended with the 5-to-20 result-limit/pagination changes from request #9
-  (same files: `src/types/journey-search.ts`,
-  `src/validators/journey-search.validator.ts`, `public/leaflet/journey-results.js`,
-  `tests/multimodal-search.test.js`) and the request #10 From/To field fix
-  (`public/leaflet/journey-results.js`, `public/journey-results.html`,
-  `public/leaflet/journey-results.css`).
-- Do not discard, reset, or overwrite those changes.
-- `git diff --check` passed after the earlier edits in this batch; its only
-  output was existing LF-to-CRLF warnings. Not yet re-run after request #9.
-- Builds, tests, database queries, migrations, benchmarks, and the exact
-  Indore-to-Jammu reproduction have not been run because command execution was
-  not authorized. This also applies to the request #9 changes.
-- The running server must be rebuilt and restarted before source changes take
-  effect.
+- The working tree now also includes, on top of everything described above:
+  `src/utils/search-semaphore.ts`, `src/utils/string-chain.ts`,
+  `src/middleware/rate-limiter.ts`, `src/middleware/metrics-auth.ts`,
+  `src/observability/metrics.ts`, `docs/production-environment-variables.md`,
+  and `tests/search-semaphore.test.js` / `tests/rate-limiter.test.js` /
+  `tests/metrics.test.js` (all new/untracked), plus modifications to
+  `src/config/database.ts`, `src/routes/health.routes.ts`,
+  `src/routes/journey.routes.ts`, `src/routes/railway.routes.ts`,
+  `src/server.ts`, `src/services/multimodal-journey.service.ts`, and
+  `src/services/railway-provider.service.ts`.
+- `src/services/places.service.ts` and the frontend
+  `public/journey-results.html` / `public/leaflet/journey-results.css` /
+  `public/leaflet/journey-results.js` changes are **not** part of this body
+  of work and were deliberately left untouched throughout requests #13-18.
+- Do not discard, reset, or overwrite any of this.
+- Command execution was authorized and used throughout requests #16-18; see
+  `PROJECT_MEMORY.md`'s "Concurrency/production-readiness work verification"
+  section for the full, itemized results (`tsc`, build, all test suites,
+  live smoke tests). Two pre-existing, real-data-dependent test failures
+  remain, confirmed unrelated to this work by `git stash` comparison against
+  the original code.
+- The running server must be rebuilt and restarted before source changes
+  take effect; this is unrelated to the still-pending railway-index
+  migration mentioned in `PROJECT_MEMORY.md`'s "Current implementation
+  state" (pagination work), which remains outstanding.
 
 ## Recommended next verification
 
-After the user explicitly authorizes command execution:
+The verification sequence used throughout requests #16-18 (all already run
+and passing except the two pre-existing failures noted above):
 
 ```bash
 npx tsc --noEmit
+npm run build
+npm run test:search-semaphore
+npm run test:rate-limiter
+npm run test:metrics
 npm run test:railway-search
 npm run test:multimodal-search
 ```
 
-Then apply the pending migration in the appropriate environment, rebuild and
-restart the application, and reproduce the user's exact API payloads against
-the development database.
+Beyond that, still outstanding: a real load-testing pass against the new
+admission-control/rate-limit/clustering defaults (all are reasoned, not
+measured), and - separately, from the earlier pagination work - applying
+the pending Prisma index migration and reproducing the user's exact
+Indore-to-Jammu API payload against the development database.

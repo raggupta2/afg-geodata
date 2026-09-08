@@ -37,6 +37,15 @@ import {
     JourneySortOrder,
     JourneyTrainResult
 } from "../types/journey-search";
+import { SearchSemaphore } from "../utils/search-semaphore";
+import { registerSemaphoreMetrics } from "../observability/metrics";
+import {
+    StringChainNode,
+    chainHas,
+    chainWith,
+    chainToArray,
+    chainToSet
+} from "../utils/string-chain";
 
 type FlightRecord = Awaited<ReturnType<typeof loadFlightInstances>>[number];
 type Policy = Awaited<ReturnType<typeof loadRoutingPolicy>>;
@@ -50,12 +59,12 @@ type SearchState = {
     scheduledLegs: number;
     lastMode: "RAIL" | "FLIGHT" | null;
     currentCityId: string | null;
-    visitedCityIds: Set<string>;
-    visitedHubIds: Set<string>;
-    usedTrainIds: Set<string>;
-    usedFlightIds: Set<string>;
+    visitedCityIds: StringChainNode | null;
+    visitedHubIds: StringChainNode | null;
+    usedTrainIds: StringChainNode | null;
+    usedFlightIds: StringChainNode | null;
     modes: Array<"RAIL" | "FLIGHT">;
-    serviceKeys: string[];
+    serviceKeys: StringChainNode | null;
     departureHub: RoutingHub;
     legs: MultimodalLeg[];
 };
@@ -238,6 +247,38 @@ const resultCache = new BoundedAsyncTtlCache<CachedMultimodalSearchResult>(
     Number(process.env.MULTIMODAL_RESULT_CACHE_MAX_ENTRIES ?? 500)
 );
 
+// Bounded admission control for the expensive multimodal graph search -
+// same SearchSemaphore mechanism as railway-provider.service.ts's
+// searchSemaphore, but a separate instance/capacity: this search is a
+// distinct, independently-expensive code path (its own DB fan-out and its
+// own bounded state-space search), so it must not share a capacity budget
+// with railway-only searches. At most MULTIMODAL_SEARCH_CONCURRENCY
+// searches execute at once; additional callers wait in a FIFO queue capped
+// at MULTIMODAL_MAX_QUEUED_SEARCHES; once that queue is full, further
+// callers are rejected immediately with a 503 rather than growing the
+// queue without bound.
+const configuredMultimodalConcurrency = Number(
+    process.env.MULTIMODAL_SEARCH_CONCURRENCY ?? 2
+);
+const configuredMultimodalMaxQueued = Number(
+    process.env.MULTIMODAL_MAX_QUEUED_SEARCHES ?? 100
+);
+const multimodalSearchSemaphore = new SearchSemaphore(
+    Number.isInteger(configuredMultimodalConcurrency)
+        && configuredMultimodalConcurrency > 0
+        ? configuredMultimodalConcurrency
+        : 2,
+    Number.isInteger(configuredMultimodalMaxQueued)
+        && configuredMultimodalMaxQueued > 0
+        ? configuredMultimodalMaxQueued
+        : 100,
+    "The multimodal journey search service is busy. Please retry shortly."
+);
+registerSemaphoreMetrics("multimodal", () => ({
+    active: multimodalSearchSemaphore.activeCount,
+    queued: multimodalSearchSemaphore.queuedCount
+}));
+
 const round = (value: number): number => Math.round(value * 10) / 10;
 const iso = (milliseconds: number): string => new Date(
     milliseconds + 330 * 60_000
@@ -317,20 +358,23 @@ function stateKey(state: SearchState): string {
         state.hubId,
         state.scheduledLegs,
         state.lastMode ?? "NONE",
-        [...state.visitedCityIds].sort().join(",")
+        chainToArray(state.visitedCityIds).sort().join(",")
     ].join("|");
 }
 
 function canVisitCity(state: SearchState, cityId: string | null): boolean {
     return cityId === null
         || cityId === state.currentCityId
-        || !state.visitedCityIds.has(cityId);
+        || !chainHas(state.visitedCityIds, cityId);
 }
 
-function withVisitedCity(state: SearchState, hub: RoutingHub): Set<string> {
-    const visited = new Set(state.visitedCityIds);
-    if (hub.cityId) visited.add(hub.cityId);
-    return visited;
+function withVisitedCity(
+    state: SearchState,
+    hub: RoutingHub
+): StringChainNode | null {
+    return hub.cityId
+        ? chainWith(state.visitedCityIds, hub.cityId)
+        : state.visitedCityIds;
 }
 
 function journeyType(modes: Array<"RAIL" | "FLIGHT">): MultimodalJourneyResult["journeyType"] {
@@ -420,7 +464,7 @@ function resultFromState(
 
     const finalAccess = roadAccess(completionAerialDistanceKm, policy);
     const finalArrivalMs = completionMs + finalAccess.minutes * 60_000;
-    const itineraryKey = state.serviceKeys.join("|");
+    const itineraryKey = chainToArray(state.serviceKeys).join("|");
     const departureMs = Date.parse(
         completionLegs[0]?.departureAt ?? request.departureAt
     );
@@ -816,8 +860,9 @@ async function executeSearch(
         const originDepartureMs = requestedMs;
         const hubArrivalMs = originDepartureMs + sourceAccess.minutes * 60_000;
         const readyMs = hubArrivalMs + buffer * 60_000;
-        const visitedCities = new Set<string>();
-        if (hub.cityId) visitedCities.add(hub.cityId);
+        const visitedCities: StringChainNode | null = hub.cityId
+            ? chainWith(null, hub.cityId)
+            : null;
         const legs: MultimodalLeg[] = [{
             mode: "LOCAL",
             from: origin,
@@ -839,11 +884,11 @@ async function executeSearch(
             lastMode: null,
             currentCityId: hub.cityId,
             visitedCityIds: visitedCities,
-            visitedHubIds: new Set([hub.id]),
-            usedTrainIds: new Set(),
-            usedFlightIds: new Set(),
+            visitedHubIds: chainWith(null, hub.id),
+            usedTrainIds: null,
+            usedFlightIds: null,
             modes: [],
-            serviceKeys: [],
+            serviceKeys: null,
             departureHub: hub,
             legs
         }, best, queue);
@@ -886,14 +931,15 @@ async function executeSearch(
                     matchesJourneyType(result, filter)
                 );
             if (matchesRequestedType) {
-                const key = JSON.stringify(state.serviceKeys);
+                const serviceKeysArray = chainToArray(state.serviceKeys);
+                const key = JSON.stringify(serviceKeysArray);
                 const known = results.get(key);
                 if (
                     !known
                     || result.totalJourneyMinutes
                         < known.result.totalJourneyMinutes
                 ) {
-                    results.set(key, { serviceKeys: state.serviceKeys, result });
+                    results.set(key, { serviceKeys: serviceKeysArray, result });
                     const accessPruned = pruneDominatedAccessPaths(
                         [...results.values()]
                     );
@@ -926,7 +972,7 @@ async function executeSearch(
                 hub.stationId,
                 instantToMinute(clock, new Date(minimumMs)),
                 clock.serviceDate,
-                state.usedTrainIds,
+                chainToSet(state.usedTrainIds),
                 policy.searchHorizonDays,
                 state.modes.includes("FLIGHT")
                     ? POST_FLIGHT_RAIL_RIDE_OPTIONS
@@ -954,13 +1000,13 @@ async function executeSearch(
                     lastMode: "RAIL",
                     currentCityId: target.cityId,
                     visitedCityIds: withVisitedCity(state, target),
-                    visitedHubIds: new Set([...state.visitedHubIds, target.id]),
-                    usedTrainIds: new Set([...state.usedTrainIds, ride.trainId]),
+                    visitedHubIds: chainWith(state.visitedHubIds, target.id),
+                    usedTrainIds: chainWith(state.usedTrainIds, ride.trainId),
                     modes: [...state.modes, "RAIL"],
-                    serviceKeys: [
-                        ...state.serviceKeys,
+                    serviceKeys: chainWith(
+                        state.serviceKeys,
                         `RAIL:${ride.trainId}:${first.serviceDate}:${hub.id}:${target.id}`
-                    ],
+                    ),
                     legs: [
                         ...state.legs,
                         ...waitLeg(hub, state.arrivalMs, departureMs, "RAIL_WAIT"),
@@ -1001,7 +1047,7 @@ async function executeSearch(
                 if (departureMs < minimumMs) continue;
                 if (state.scheduledLegs === 0
                     && departureMs >= firstServiceDateEndMs) continue;
-                if (state.usedFlightIds.has(flight.identityKey)) continue;
+                if (chainHas(state.usedFlightIds, flight.identityKey)) continue;
                 const target = hubs.get(flight.arrivalAirport.hub.id.toString());
                 if (!target || !canVisitCity(state, target.cityId)) continue;
                 const targetCount = destinationCounts.get(target.id) ?? 0;
@@ -1021,10 +1067,10 @@ async function executeSearch(
                     lastMode: "FLIGHT",
                     currentCityId: target.cityId,
                     visitedCityIds: withVisitedCity(state, target),
-                    visitedHubIds: new Set([...state.visitedHubIds, target.id]),
-                    usedFlightIds: new Set([...state.usedFlightIds, flight.identityKey]),
+                    visitedHubIds: chainWith(state.visitedHubIds, target.id),
+                    usedFlightIds: chainWith(state.usedFlightIds, flight.identityKey),
                     modes: [...state.modes, "FLIGHT"],
-                    serviceKeys: [...state.serviceKeys, `FLIGHT:${flight.identityKey}`],
+                    serviceKeys: chainWith(state.serviceKeys, `FLIGHT:${flight.identityKey}`),
                     legs: [
                         ...state.legs,
                         ...waitLeg(hub, state.arrivalMs, departureMs, "FLIGHT_WAIT"),
@@ -1054,7 +1100,7 @@ async function executeSearch(
         if (state.scheduledLegs > 0) {
             for (const transfer of transfersByHub.get(hub.id) ?? []) {
                 const target = hubs.get(transfer.toHubId.toString());
-                if (!target || state.visitedHubIds.has(target.id)) continue;
+                if (!target || chainHas(state.visitedHubIds, target.id)) continue;
                 let extraMinutes = 0;
                 let transferType = "INTERMODAL_TRANSFER";
                 if (state.lastMode === "RAIL" && target.type === "AIRPORT") {
@@ -1076,7 +1122,7 @@ async function executeSearch(
                         request.destination.latitude, request.destination.longitude
                     ),
                     currentCityId: target.cityId,
-                    visitedHubIds: new Set([...state.visitedHubIds, target.id]),
+                    visitedHubIds: chainWith(state.visitedHubIds, target.id),
                     legs: [...state.legs, {
                         mode: "TRANSFER",
                         from: place(hub),
@@ -1274,9 +1320,9 @@ export async function searchMultimodalJourneys(
     );
     const result = await resultCache.getOrLoad(
         `${railOnly ? "rail-only" : "multimodal"}:${key}`,
-        () => railOnly
+        () => multimodalSearchSemaphore.run(() => railOnly
             ? executeRailOnlySearch(searchRequest)
-            : executeSearch(searchRequest)
+            : executeSearch(searchRequest))
     );
     return paginateCachedSearchResult(result, boundedRequest);
 }

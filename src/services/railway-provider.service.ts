@@ -1,5 +1,4 @@
 import { JourneyRoutingPolicy } from "@prisma/client";
-import { ApiError } from "../errors/api.error";
 import { BoundedAsyncTtlCache } from "../cache/bounded-async-ttl-cache";
 import { findAllActiveJourneyConnections } from "../repositories/railway-routing.repository";
 import { JourneyConnection, JourneyStation } from "../types/railway-journey";
@@ -8,6 +7,9 @@ import {
     railwayRunsOnDay,
     RailwayOperatingDay
 } from "../utils/railway-runs-mask";
+import { SearchSemaphore } from "../utils/search-semaphore";
+import { registerSemaphoreMetrics } from "../observability/metrics";
+import { StringChainNode, chainHas, chainWith } from "../utils/string-chain";
 
 type TrainBoarding = {
     trainId: string;
@@ -33,8 +35,8 @@ type JourneySearchState = {
     arrivalMinute: number;
     estimatedTotalLegs: number;
     rides: JourneyConnection[][];
-    visitedStationIds: Set<string>;
-    usedTrainIds: Set<string>;
+    visitedStations: StringChainNode | null;
+    usedTrains: StringChainNode | null;
 };
 
 type RoundLabel = {
@@ -124,39 +126,18 @@ export function resolveRailwayRoutingLimits(
 let graphSnapshot: RailwayGraphSnapshot | null = null;
 let graphLoadPromise: Promise<RailwayGraphSnapshot> | null = null;
 
-class SearchSemaphore {
-    private active = 0;
-    private readonly queue: Array<() => void> = [];
-
-    constructor(private readonly maximum: number) {}
-
-    async run<Value>(task: () => Promise<Value>): Promise<Value> {
-        if (this.active >= this.maximum) {
-            if (this.queue.length >= MAX_QUEUED_SEARCHES) {
-                throw new ApiError(
-                    503,
-                    "The railway routing service is busy. Please retry shortly."
-                );
-            }
-            await new Promise<void>(resolve => this.queue.push(resolve));
-        }
-
-        this.active += 1;
-        try {
-            return await task();
-        } finally {
-            this.active -= 1;
-            this.queue.shift()?.();
-        }
-    }
-}
-
 const configuredConcurrency = Number(process.env.RAILWAY_SEARCH_CONCURRENCY ?? 2);
 const searchSemaphore = new SearchSemaphore(
     Number.isInteger(configuredConcurrency) && configuredConcurrency > 0
         ? configuredConcurrency
-        : 2
+        : 2,
+    MAX_QUEUED_SEARCHES,
+    "The railway routing service is busy. Please retry shortly."
 );
+registerSemaphoreMetrics("railway", () => ({
+    active: searchSemaphore.activeCount,
+    queued: searchSemaphore.queuedCount
+}));
 const providerResultCache = new BoundedAsyncTtlCache<RailwayProviderResult>(
     Number(process.env.RAILWAY_PROVIDER_CACHE_TTL_MS ?? 2 * 60 * 1000),
     Number(process.env.RAILWAY_PROVIDER_CACHE_MAX_ENTRIES ?? 2_000)
@@ -596,8 +577,8 @@ async function searchEarliestPaths(
             arrivalMinute: origin.readyMinute,
             estimatedTotalLegs: minimumLegs,
             rides: [],
-            visitedStationIds: new Set([origin.stationId]),
-            usedTrainIds: new Set()
+            visitedStations: chainWith(null, origin.stationId),
+            usedTrains: null
         };
         queue.push(state);
         registerState(state, labels);
@@ -672,7 +653,7 @@ async function searchEarliestPaths(
             + (state.rides.length > 0 ? limits.minimumRailTransferMinutes : 0);
         const boardings = snapshot.boardingsByStation.get(state.stationId) ?? [];
         for (const boarding of boardings) {
-            if (state.usedTrainIds.has(boarding.trainId)) continue;
+            if (chainHas(state.usedTrains, boarding.trainId)) continue;
             const occurrence = findNextTrainOccurrence(
                 boarding,
                 earliestDeparture,
@@ -689,9 +670,20 @@ async function searchEarliestPaths(
             }
 
             const ride: JourneyConnection[] = [];
+            // Extended by exactly one node per connection processed, in
+            // lockstep with `ride` - at any alighting-allowed connection
+            // below, rideVisited represents exactly the same membership as
+            // the original `new Set([...state.visitedStationIds,
+            // ...ride.map(...)])` would have at that same point. The break
+            // check just above always tests against the parent state's own
+            // (pre-ride) chain, never this accumulating one - preserving
+            // the original code's behavior of only guarding against
+            // stations visited before this ride began.
+            let rideVisited = state.visitedStations;
             for (const connection of occurrence) {
-                if (state.visitedStationIds.has(connection.toStation.id)) break;
+                if (chainHas(state.visitedStations, connection.toStation.id)) break;
                 ride.push(connection);
+                rideVisited = chainWith(rideVisited, connection.toStation.id);
                 if (!connection.alightingAllowed) continue;
 
                 const remaining = minimumRemainingLegs.get(
@@ -707,14 +699,8 @@ async function searchEarliestPaths(
                     arrivalMinute: connection.arrivalMinute,
                     estimatedTotalLegs: nextLegCount + remaining,
                     rides: [...state.rides, [...ride]],
-                    visitedStationIds: new Set([
-                        ...state.visitedStationIds,
-                        ...ride.map(item => item.toStation.id)
-                    ]),
-                    usedTrainIds: new Set([
-                        ...state.usedTrainIds,
-                        boarding.trainId
-                    ])
+                    visitedStations: rideVisited,
+                    usedTrains: chainWith(state.usedTrains, boarding.trainId)
                 };
                 if (!registerState(nextState, labels)) continue;
                 queue.push(nextState);
@@ -847,8 +833,8 @@ async function searchRoundBasedPaths(
                     arrivalMinute: label.arrivalMinute,
                     estimatedTotalLegs: round,
                     rides: label.rides,
-                    visitedStationIds: new Set(),
-                    usedTrainIds: label.usedTrainIds
+                    visitedStations: null,
+                    usedTrains: null
                 });
                 const key = [
                     path.destinationStationId,

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Compare multimodal train, flight, and road journeys.">
     <title>Journey Results | AFG Geodata</title>
+    <link rel="icon" href="/favicon.ico" sizes="32x32">
     <link rel="stylesheet" href="/leaflet/journey-results.css">
 </head>
 <body>
@@ -30,7 +31,7 @@
             </div>
 
             <form id="journeySearchForm" class="search-form" novalidate>
-                 <div class="location-fields address-fields">
+                <div class="location-fields address-fields">
                     <div class="field autocomplete-field">
                         <label for="originAddressLabel">From <span class="label-hint">(address)</span></label>
                         <div class="input-with-icon">
@@ -60,16 +61,16 @@
                         <ul id="destinationAddressSuggestions" class="suggestions" role="listbox"></ul>
                     </div>
                 </div>
-                
-                <div class="location-fields is-hidden">
+
+                <div class="location-fields">
                     <div class="field autocomplete-field">
                         <label for="originLabel">From <span class="label-hint">(station)</span></label>
                         <div class="input-with-icon">
                             <span class="field-icon origin-dot" aria-hidden="true"></span>
                             <input id="originLabel" name="originLabel" type="search"
-                                placeholder="City or railway station" autocomplete="off"
+                                placeholder="Railway station" autocomplete="off"
                                 role="combobox" aria-autocomplete="list"
-                                aria-controls="originSuggestions" aria-expanded="false" required>
+                                aria-controls="originSuggestions" aria-expanded="false">
                         </div>
                         <ul id="originSuggestions" class="suggestions" role="listbox"></ul>
                         <input id="originLatitude" type="hidden">
@@ -83,17 +84,15 @@
                         <div class="input-with-icon">
                             <span class="field-icon destination-dot" aria-hidden="true"></span>
                             <input id="destinationLabel" name="destinationLabel" type="search"
-                                placeholder="City or railway station" autocomplete="off"
+                                placeholder="Railway station" autocomplete="off"
                                 role="combobox" aria-autocomplete="list"
-                                aria-controls="destinationSuggestions" aria-expanded="false" required>
+                                aria-controls="destinationSuggestions" aria-expanded="false">
                         </div>
                         <ul id="destinationSuggestions" class="suggestions" role="listbox"></ul>
                         <input id="destinationLatitude" type="hidden">
                         <input id="destinationLongitude" type="hidden">
                     </div>
                 </div>
-
-               
 
                 <div class="field date-field">
                     <label for="departureAt">Departure date and time</label>

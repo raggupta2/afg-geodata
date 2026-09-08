@@ -375,9 +375,10 @@ main { margin: 0 auto; max-width: 1440px; padding: 28px 24px 64px; }
     gap: 18px;
     grid-template-columns: minmax(120px, auto) minmax(150px, 1fr) minmax(120px, auto) auto;
 }
+.endpoint { min-width: 0; }
 .endpoint-time { font-size: 24px; font-weight: 800; letter-spacing: -.035em; line-height: 1.1; }
 .endpoint-date { color: var(--muted); font-size: 11px; margin-top: 4px; }
-.endpoint-place { color: #344054; font-size: 12px; font-weight: 650; margin-top: 7px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.endpoint-place { display: block; color: #344054; font-size: 12px; font-weight: 650; margin-top: 7px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .route-visual { min-width: 0; text-align: center; }
 .route-line { align-items: center; display: flex; }
 .route-line::before, .route-line::after { background: #cfd6e0; content: ""; flex: 1; height: 1px; }
@@ -469,7 +470,7 @@ main { margin: 0 auto; max-width: 1440px; padding: 28px 24px 64px; }
 @media (max-width: 1020px) {
     .search-form { grid-template-columns: 1fr 220px; }
     .primary-button { grid-column: 2; }
-    .location-fields { grid-row: span 2; }
+    .address-fields { grid-row: span 2; }
     .results-workspace { grid-template-columns: 240px minmax(0, 1fr); }
     .summary-route { gap: 12px; grid-template-columns: auto minmax(110px, 1fr) auto; }
     .summary-duration { border: 0; grid-column: 1 / -1; padding: 2px 0 0; }

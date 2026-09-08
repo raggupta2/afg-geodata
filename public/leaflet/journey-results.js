@@ -19,7 +19,8 @@ const state = {
     quickFilter: null,
     maximumTransferLimit: null,
     timeZone: "Asia/Kolkata",
-    addressSessionTokens: { origin: null, destination: null }
+    addressSessionTokens: { origin: null, destination: null },
+    labelSource: { origin: "station", destination: "station" }
 };
 
 const elements = {};
@@ -205,6 +206,8 @@ function selectStation(prefix, feature) {
     elements[`${prefix}Latitude`].value = coordinates[1] ?? "";
     elements[`${prefix}Longitude`].value = coordinates[0] ?? "";
     elements[`${prefix}Label`].removeAttribute("aria-invalid");
+    elements[`${prefix}AddressLabel`].removeAttribute("aria-invalid");
+    state.labelSource[prefix] = "station";
     closeSuggestions(
         elements[`${prefix}Label`], elements[`${prefix}Suggestions`]
     );
@@ -227,6 +230,8 @@ function swapLocations() {
         const destination = elements[`destination${suffix}`];
         [origin.value, destination.value] = [destination.value, origin.value];
     }
+    [state.labelSource.origin, state.labelSource.destination] =
+        [state.labelSource.destination, state.labelSource.origin];
 }
 
 function useCurrentLocation() {
@@ -389,8 +394,9 @@ async function selectAddress(target, suggestion) {
 
         elements[`${target}Latitude`].value = body.data.latitude;
         elements[`${target}Longitude`].value = body.data.longitude;
-        elements[`${target}Label`].value = body.data.formattedAddress;
-        elements[`${target}Label`].removeAttribute("aria-invalid");
+        input.value = body.data.formattedAddress;
+        input.removeAttribute("aria-invalid");
+        state.labelSource[target] = "address";
         // The session is complete; the next search starts a fresh billing session.
         state.addressSessionTokens[target] = null;
     } catch {
@@ -398,16 +404,21 @@ async function selectAddress(target, suggestion) {
     }
 }
 
+function currentLabel(prefix) {
+    const source = state.labelSource[prefix] === "address" ? "AddressLabel" : "Label";
+    return elements[`${prefix}${source}`].value.trim() || undefined;
+}
+
 function validateAndBuildRequest() {
     let valid = true;
     for (const prefix of ["origin", "destination"]) {
-        const label = elements[`${prefix}Label`];
         const latitude = Number(elements[`${prefix}Latitude`].value);
         const longitude = Number(elements[`${prefix}Longitude`].value);
         const hasCoordinates = Number.isFinite(latitude) && Number.isFinite(longitude)
             && elements[`${prefix}Latitude`].value !== ""
             && elements[`${prefix}Longitude`].value !== "";
-        label.setAttribute("aria-invalid", String(!hasCoordinates));
+        elements[`${prefix}Label`].setAttribute("aria-invalid", String(!hasCoordinates));
+        elements[`${prefix}AddressLabel`].setAttribute("aria-invalid", String(!hasCoordinates));
         if (!hasCoordinates) valid = false;
     }
     const departureLocal = elements.departureAt.value;
@@ -425,12 +436,12 @@ function validateAndBuildRequest() {
         origin: {
             latitude: Number(elements.originLatitude.value),
             longitude: Number(elements.originLongitude.value),
-            label: elements.originLabel.value.trim() || undefined
+            label: currentLabel("origin")
         },
         destination: {
             latitude: Number(elements.destinationLatitude.value),
             longitude: Number(elements.destinationLongitude.value),
-            label: elements.destinationLabel.value.trim() || undefined
+            label: currentLabel("destination")
         },
         departureAt,
         options: {

@@ -7,35 +7,39 @@ import {
     AddressSuggestionsInput
 } from "../types/places";
 
-const AUTOCOMPLETE_URL = "https://maps.googleapis.com/maps/api/place/autocomplete/json";
-const DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json";
+const AUTOCOMPLETE_URL = "https://places.googleapis.com/v1/places:autocomplete";
+const DETAILS_BASE_URL = "https://places.googleapis.com/v1/places";
 const REQUEST_TIMEOUT_MS = 5_000;
-const DETAILS_FIELDS = "place_id,formatted_address,name,geometry/location";
+const DETAILS_FIELD_MASK = "id,formattedAddress,displayName,location";
 
-type GooglePrediction = {
-    place_id: string;
-    description: string;
-    structured_formatting?: {
-        main_text?: string;
-        secondary_text?: string;
+type GooglePlacePrediction = {
+    placePrediction?: {
+        placeId?: string;
+        text?: { text?: string };
+        structuredFormat?: {
+            mainText?: { text?: string };
+            secondaryText?: { text?: string };
+        };
     };
 };
 
 type GoogleAutocompleteResponse = {
-    status: string;
-    predictions?: GooglePrediction[];
-    error_message?: string;
+    suggestions?: GooglePlacePrediction[];
 };
 
 type GoogleDetailsResponse = {
-    status: string;
-    result?: {
-        place_id: string;
-        formatted_address: string;
-        name?: string;
-        geometry?: { location?: { lat?: number; lng?: number } };
+    id?: string;
+    formattedAddress?: string;
+    displayName?: { text?: string };
+    location?: { latitude?: number; longitude?: number };
+};
+
+type GoogleApiErrorBody = {
+    error?: {
+        code?: number;
+        message?: string;
+        status?: string;
     };
-    error_message?: string;
 };
 
 function requireApiKey(): string {
@@ -47,17 +51,32 @@ function requireApiKey(): string {
     return apiKey;
 }
 
-async function fetchGooglePlaces<T>(url: URL): Promise<T> {
+async function fetchGooglePlaces<T>(url: string | URL, init: RequestInit): Promise<T> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-        const response = await fetch(url, { signal: controller.signal });
+        const response = await fetch(url, { ...init, signal: controller.signal });
+        const body = await response.json() as T & GoogleApiErrorBody;
+
         if (!response.ok) {
-            logger.error({ status: response.status }, "Google Places API HTTP error");
-            throw new ApiError(502, "Address search is temporarily unavailable.");
+            logger.error(
+                {
+                    httpStatus: response.status,
+                    status: body?.error?.status,
+                    errorMessage: body?.error?.message
+                },
+                "Google Places API returned an error"
+            );
+            throw new ApiError(
+                response.status === 404 ? 404 : 502,
+                response.status === 404
+                    ? "The selected address could not be found."
+                    : "Address search is temporarily unavailable."
+            );
         }
-        return await response.json() as T;
+
+        return body;
     } catch (error) {
         if (error instanceof ApiError) throw error;
         if ((error as Error)?.name === "AbortError") {
@@ -70,31 +89,35 @@ async function fetchGooglePlaces<T>(url: URL): Promise<T> {
     }
 }
 
-const RECOVERABLE_STATUSES = new Set(["OK", "ZERO_RESULTS"]);
-
 export async function searchAddressSuggestions(
     input: AddressSuggestionsInput
 ): Promise<AddressSuggestion[]> {
     const apiKey = requireApiKey();
 
-    const url = new URL(AUTOCOMPLETE_URL);
-    url.searchParams.set("input", input.input);
-    url.searchParams.set("key", apiKey);
-    if (input.sessionToken) url.searchParams.set("sessiontoken", input.sessionToken);
+    const body = await fetchGooglePlaces<GoogleAutocompleteResponse>(AUTOCOMPLETE_URL, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": apiKey
+        },
+        body: JSON.stringify({
+            input: input.input,
+            ...(input.sessionToken ? { sessionToken: input.sessionToken } : {})
+        })
+    });
 
-    const body = await fetchGooglePlaces<GoogleAutocompleteResponse>(url);
-
-    if (!RECOVERABLE_STATUSES.has(body.status)) {
-        logger.error({ status: body.status }, "Google Places autocomplete returned an error status");
-        throw new ApiError(502, "Address search is temporarily unavailable.");
-    }
-
-    return (body.predictions ?? []).map(prediction => ({
-        placeId: prediction.place_id,
-        description: prediction.description,
-        mainText: prediction.structured_formatting?.main_text ?? prediction.description,
-        secondaryText: prediction.structured_formatting?.secondary_text ?? null
-    }));
+    return (body.suggestions ?? [])
+        .filter(suggestion => Boolean(suggestion.placePrediction?.placeId))
+        .map(suggestion => {
+            const prediction = suggestion.placePrediction!;
+            const description = prediction.text?.text ?? "";
+            return {
+                placeId: prediction.placeId!,
+                description,
+                mainText: prediction.structuredFormat?.mainText?.text ?? description,
+                secondaryText: prediction.structuredFormat?.secondaryText?.text ?? null
+            };
+        });
 }
 
 export async function getAddressDetails(
@@ -102,34 +125,30 @@ export async function getAddressDetails(
 ): Promise<AddressDetails> {
     const apiKey = requireApiKey();
 
-    const url = new URL(DETAILS_URL);
-    url.searchParams.set("place_id", input.placeId);
-    url.searchParams.set("fields", DETAILS_FIELDS);
-    url.searchParams.set("key", apiKey);
-    if (input.sessionToken) url.searchParams.set("sessiontoken", input.sessionToken);
+    const url = new URL(`${DETAILS_BASE_URL}/${encodeURIComponent(input.placeId)}`);
+    if (input.sessionToken) url.searchParams.set("sessionToken", input.sessionToken);
 
-    const body = await fetchGooglePlaces<GoogleDetailsResponse>(url);
+    const body = await fetchGooglePlaces<GoogleDetailsResponse>(url, {
+        method: "GET",
+        headers: {
+            "X-Goog-Api-Key": apiKey,
+            "X-Goog-FieldMask": DETAILS_FIELD_MASK
+        }
+    });
 
-    if (body.status !== "OK" || !body.result) {
-        logger.error({ status: body.status }, "Google Places details returned an error status");
-        throw new ApiError(
-            body.status === "NOT_FOUND" ? 404 : 502,
-            body.status === "NOT_FOUND"
-                ? "The selected address could not be found."
-                : "Address lookup is temporarily unavailable."
-        );
-    }
-
-    const location = body.result.geometry?.location;
-    if (typeof location?.lat !== "number" || typeof location?.lng !== "number") {
+    const location = body.location;
+    if (typeof location?.latitude !== "number" || typeof location?.longitude !== "number") {
         throw new ApiError(502, "The selected address is missing location data.");
+    }
+    if (!body.id || !body.formattedAddress) {
+        throw new ApiError(502, "The selected address is missing required data.");
     }
 
     return {
-        placeId: body.result.place_id,
-        formattedAddress: body.result.formatted_address,
-        name: body.result.name ?? null,
-        latitude: location.lat,
-        longitude: location.lng
+        placeId: body.id,
+        formattedAddress: body.formattedAddress,
+        name: body.displayName?.text ?? null,
+        latitude: location.latitude,
+        longitude: location.longitude
     };
 }

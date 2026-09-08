@@ -1,6 +1,6 @@
 # AFG Geodata Project Memory
 
-Last updated: 2026-09-05 (Asia/Calcutta)
+Last updated: 2026-09-08 (Asia/Calcutta)
 
 This file is durable working memory for future development sessions. Read it
 together with `AGENTS.md`, which remains the authoritative engineering policy.
@@ -205,8 +205,97 @@ made as one performance/correctness effort:
   parenthetical "(address)"/"(station)" hints, and `journey-results.css`
   gained a `.label-hint` rule, to disambiguate the two stacked row pairs.
 
+## Concurrency, admission control, and production-readiness work
+
+Separate from the pagination/UI work above. Read-only analysis (route-search
+algorithm identification, a performance-optimization plan, and a concurrency
+production-readiness audit) preceded implementation; see "Conversation
+chronology" below for what was analysis-only versus what was implemented.
+
+Established findings (analysis, not yet all acted on):
+- Route search is **not** literal RAPTOR or CSA. The railway engine
+  (`searchEarliestPaths` in `railway-provider.service.ts`) is a priority-queue
+  label-setting search - Dijkstra when sorting by arrival, A\* (admissible
+  leg-count heuristic) when sorting by transfers (the default). The
+  multimodal engine (`executeSearch` in `multimodal-journey.service.ts`) is
+  explicitly a **weighted** A\* (its own code comments say so) over a hub
+  graph, using a Haversine-distance time heuristic. A RAPTOR-shaped function,
+  `searchRoundBasedPaths` in `railway-provider.service.ts`, exists but has
+  **zero call sites** anywhere - confirmed dead code, deliberately left
+  untouched.
+- The single biggest pre-existing production gap was that the multimodal
+  search had **no admission control** at all, unlike the railway engine's
+  existing `SearchSemaphore` - fixed, see below.
+
+Implemented (in the working tree, verified - see "Verification status"):
+- **Admission control**: `SearchSemaphore` (bounded active-count + FIFO wait
+  queue + immediate `503` once the queue is full, always released via
+  try/finally) extracted from `railway-provider.service.ts` into
+  `src/utils/search-semaphore.ts` and reused by a new, independent instance
+  in `multimodal-journey.service.ts`, wrapping only the actual cache-miss
+  search execution (both `executeSearch` and `executeRailOnlySearch`) inside
+  `searchMultimodalJourneys` - cache *hits* never touch the semaphore.
+- **DB connection pool**: `config/database.ts` now appends
+  `connection_limit=<DATABASE_CONNECTION_LIMIT>` (default 10) to
+  `DATABASE_URL` unless already present, via Prisma's own connection-string
+  mechanism - still exactly one `PrismaClient` singleton.
+- **Rate limiting**: `src/middleware/rate-limiter.ts`, an in-process
+  per-IP fixed-window limiter (`SEARCH_RATE_LIMIT_WINDOW_MS`/
+  `SEARCH_RATE_LIMIT_MAX_REQUESTS`), applied only to the two search POST
+  routes, responding `429` (distinct from the semaphores' `503`). Both route
+  files share one `resolveRateLimiterConfig()` to avoid config drift.
+- **Metrics**: `src/observability/metrics.ts` - semaphore active/queued
+  counts, event-loop delay (via `perf_hooks.monitorEventLoopDelay`), a Prisma
+  query-duration proxy (via non-preview query-event logging in
+  `database.ts` - **not** literal pool-wait time), and process memory,
+  exposed at `GET /api/v1/health/metrics` (gated by optional
+  `METRICS_ACCESS_TOKEN`, open with a startup warning if unset) and logged
+  periodically (`METRICS_LOG_INTERVAL_MS`, only started from `server.ts`,
+  never on module import).
+- **Clustering**: opt-in via `CLUSTER_WORKERS` (default 1 = unchanged
+  single-process behavior) in `server.ts`, using Node's built-in `cluster`
+  module - crashed workers auto-replaced, `SIGTERM`/`SIGINT` fan out and wait
+  for all workers before the primary exits. **Every per-worker env var above
+  is enforced per worker process, not cluster-wide** (own Prisma client, own
+  graph snapshot, own caches, own semaphores, own rate-limiter state) - the
+  primary logs a `warn`-level line at cluster startup with the actual
+  configured values so this multiplication is visible at deploy time, not
+  just documented. Full reference: `docs/production-environment-variables.md`.
+- **Search-engine allocation fixes**: `visitedStationIds`/`usedTrainIds`
+  (railway) and `visitedCityIds`/`visitedHubIds`/`usedTrainIds`/
+  `usedFlightIds`/`serviceKeys` (multimodal) converted from `Set`/array
+  copy-on-every-expansion to a shared immutable linked chain
+  (`src/utils/string-chain.ts`, O(1) prepend instead of O(depth) copy). This
+  also corrected an earlier under-estimate: the railway engine was
+  re-copying its visited-station set at *every* alighting-allowed stop
+  within a single train boarding, an O(stops²) cost per boarding, not just
+  O(legs). `rides`/`ride` (railway) and `modes`/`legs` (multimodal) were
+  deliberately left as plain arrays - small, bounded, and every read site
+  needs full enumeration anyway, so there was no allocation win to capture.
+  Behavior-preservation was verified by running the real-DB test suites
+  before and after via git-stash comparison, confirming byte-identical
+  pass/fail results at each step (see "Verification status").
+
+Deferred / explicitly not done (flagged, not silently skipped):
+- Multi-process CPU parallelism beyond opt-in clustering (no adaptive
+  autoscaling).
+- Enabling Prisma's `metrics` preview feature (would give literal
+  connection-pool wait time) - a `schema.prisma` change, not made without
+  checking first.
+- Converting `rides`/`ride`/`modes`/`legs` to the linked-chain
+  representation (see above - judged not worth the added risk/complexity
+  this round).
+- A full load-testing pass against the new admission-control/rate-limit/
+  clustering defaults - defaults are reasoned, not measured.
+
 ## Relevant files
 
+- `src/utils/search-semaphore.ts`, `src/utils/string-chain.ts`
+- `src/middleware/rate-limiter.ts`, `src/middleware/metrics-auth.ts`
+- `src/observability/metrics.ts`
+- `docs/production-environment-variables.md`
+- `tests/search-semaphore.test.js`, `tests/rate-limiter.test.js`,
+  `tests/metrics.test.js`
 - `public/journey-results.html`
 - `public/leaflet/journey-results.js`
 - `public/leaflet/journey-results.css`
@@ -262,6 +351,38 @@ application. For a definitive direct-train verification, obtain the exact
 Indore and Jammu coordinates/station selections, departure date and time, and
 API payload used by the user, then reproduce it against the development
 database before making further ranking or candidate-generation changes.
+
+### Concurrency/production-readiness work verification (2026-09-08)
+
+Command execution was authorized for this work. Verified, in order, after
+each change (not only at the end):
+
+- `npx tsc --noEmit` - clean throughout.
+- `npm run build` - clean throughout.
+- `tests/search-semaphore.test.js` (8), `tests/rate-limiter.test.js` (5),
+  `tests/metrics.test.js` (4) - new, all passing; pure unit tests with no DB
+  dependency, using controllable deferred promises/an injectable clock
+  rather than real timers.
+- `tests/railway-search.test.js` - 12/13 passing, consistently, before and
+  after every change in this body of work. The one failure
+  (`date-only search includes the direct HW to LMNR train`) is pre-existing
+  and unrelated - reconfirmed via `git stash` comparison against the
+  original code, where it fails identically (real train-schedule data for
+  that date, not caused by any change here).
+- `tests/multimodal-search.test.js` - 22/23 passing, consistently, same
+  method. The one failure
+  (`DDN to DEL on 2026-09-18 ranks the direct DED flight ahead of rail-only routes`)
+  is likewise pre-existing and confirmed unrelated the same way, even though
+  it directly exercises the newly-wrapped `searchMultimodalJourneys` path.
+- Live smoke tests (manual `curl` against a locally-run `dist/server.js`):
+  single-process boot; rate-limiter 429 after the configured max; cluster
+  boot with `CLUSTER_WORKERS=2` (both workers bound the shared port) followed
+  by clean `SIGTERM` shutdown with zero orphaned processes; the cluster
+  startup warning log correctly echoing actually-configured env values; the
+  metrics endpoint open by default and correctly returning `401` without/with
+  the wrong `METRICS_ACCESS_TOKEN` and `200` with the correct one.
+- Neither pre-existing failure has been fixed - out of scope, and doing so
+  was never requested.
 
 ## Conversation chronology
 
@@ -328,3 +449,46 @@ database before making further ranking or candidate-generation changes.
     `src/services/places.service.ts`, `src/types/places.ts`,
     `src/validators/places.validator.ts`) was **kept** - it's still actively
     called by `journey-results.html`'s own address-autocomplete fields.
+12. The user asked which route-search algorithm was actually in use (RAPTOR,
+    CSA, or Dijkstra). Read-only trace of the live code path found neither
+    literally - see "Established findings" above.
+13. The user asked for a deeper, read-only performance-optimization plan:
+    per-item file/function, bottleneck, expected impact, correctness risk,
+    benchmark method, and P0/P1/P2 priority, plus direct answers on whether
+    the algorithm itself or the implementation was the bottleneck (the
+    implementation), at what scale RAPTOR/CSA would win, and whether a
+    hybrid made sense. Analysis only, nothing implemented yet.
+14. The user asked for a read-only production-readiness audit specifically
+    about concurrent users (1/5/10/25/50/100), tracing every concurrency
+    control end to end. Verdict: **CONDITIONAL** - the biggest gap was no
+    admission control at all on the multimodal endpoint. Analysis only.
+15. The user authorized implementation of the audit's P0 fixes: bounded
+    admission control for multimodal search (reusing/extracting the
+    railway engine's existing `SearchSemaphore`), an explicit Prisma
+    connection-pool size, and a consistent `503` overload contract - with
+    tests, and explicit instructions not to touch the search algorithms,
+    priority queues, or `Set`/array allocations in that round.
+16. The user asked to continue with the audit's remaining P1/P2 items; asked
+    which to do now, all four were selected (HTTP rate limiting, metrics/
+    observability, opt-in clustering, and the previously-deferred per-state
+    allocation fixes), with rate limiting specified as in-process/no-new-
+    dependency. All four were implemented and verified as described above.
+17. The user asked for a final production-readiness review: re-check rate
+    limiting/clustering/DB limits/concurrency/metrics, specifically make
+    sure `CLUSTER_WORKERS > 1` correctly accounts for per-worker capacity
+    and rate limits, document the new env vars, and decide whether
+    `/api/v1/health/metrics` needs protection - while leaving pre-existing
+    failures and unrelated files (`places.service.ts`, the frontend
+    `journey-results.*` files) untouched. Findings and fixes: added a
+    cluster-startup warning log that echoes actually-configured values for
+    the four per-worker variables (previously only documented in code
+    comments, not surfaced at runtime); added optional `METRICS_ACCESS_TOKEN`
+    gating for the metrics endpoint (open by default with a startup
+    warning, matching `/health`'s existing unauthenticated convention);
+    added `pid`/`configuredClusterWorkers` to the metrics snapshot so a
+    single worker's numbers are never mistaken for a cluster-wide total;
+    deduplicated the rate-limiter config parsing that had been copy-pasted
+    across both route files into one shared resolver; added unit tests for
+    the previously-uncovered rate limiter and metrics/metrics-auth modules;
+    wrote `docs/production-environment-variables.md` as the durable env-var
+    reference. No pre-existing failure was touched or hidden.

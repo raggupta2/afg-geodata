@@ -10,6 +10,9 @@
     "test:railway-search": "npm run build && node --test --test-concurrency=1 tests/railway-search.test.js",
     "test:railway-routes": "npm run test:railway-search",
     "test:multimodal-search": "npm run build && node --test --test-concurrency=1 tests/multimodal-search.test.js",
+    "test:search-semaphore": "npm run build && node --test --test-concurrency=1 tests/search-semaphore.test.js",
+    "test:rate-limiter": "npm run build && node --test --test-concurrency=1 tests/rate-limiter.test.js",
+    "test:metrics": "npm run build && node --test --test-concurrency=1 tests/metrics.test.js",
     "data:import-trains": "python scripts/import_train_timetables.py",
     "data:import-aviation": "npm run build && node dist/maintenance/import-aviation-edge.js",
     "prisma": "prisma"
