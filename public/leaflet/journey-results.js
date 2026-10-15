@@ -5,6 +5,12 @@ const PAGE_SIZE = 5;
 const MAX_JOURNEYS = 20;
 const SCHEDULED_MODES = new Set(["RAIL", "FLIGHT"]);
 const mobileFilterMedia = window.matchMedia("(max-width: 780px)");
+const DEFAULT_JOURNEY_TYPE = "RAIL_ONLY";
+const JOURNEY_TYPE_SERVER_FILTERS = {
+    RAIL_ONLY: ["RAIL_ONLY"],
+    FLIGHT_ONLY: ["FLIGHT_ONLY"],
+    MIXED: ["RAIL_TO_FLIGHT", "FLIGHT_TO_RAIL"]
+};
 
 const state = {
     journeys: [],
@@ -20,7 +26,8 @@ const state = {
     maximumTransferLimit: null,
     timeZone: "Asia/Kolkata",
     addressSessionTokens: { origin: null, destination: null },
-    labelSource: { origin: "station", destination: "station" }
+    labelSource: { origin: "station", destination: "station" },
+    workspaceRevealed: false
 };
 
 const elements = {};
@@ -61,7 +68,7 @@ function bindEvents() {
     elements.useLocationButton.addEventListener("click", useCurrentLocation);
     elements.swapLocationsButton.addEventListener("click", swapLocations);
     elements.sortBy.addEventListener("change", () => {
-        if (state.lastRequest) submitSearch(state.lastRequest);
+        if (state.lastRequest) submitSearch(state.lastRequest, { isFilterRefresh: true });
     });
     elements.maximumTransfers.addEventListener("input", () => {
         state.maximumTransferLimit = Number(elements.maximumTransfers.value);
@@ -83,10 +90,10 @@ function bindEvents() {
     elements.clearFiltersButton.addEventListener("click", clearFilters);
     elements.activeFilters.addEventListener("click", removeFilterFromChip);
     elements.showMoreButton.addEventListener("click", loadMoreJourneys);
-    elements.journeyResults.addEventListener("click", toggleJourneyDetails);
+    elements.journeyResults.addEventListener("click", handleResultsClick);
     elements.retryButton.addEventListener("click", () => submitSearch(state.lastRequest));
     elements.emptyActionButton.addEventListener("click", () => {
-        if (state.journeys.length || selectedJourneyTypes().length) clearFilters();
+        if (state.journeys.length || hasActiveFilters()) clearFilters();
         else elements.departureAt.focus();
     });
     elements.openFiltersButton.addEventListener("click", openFilters);
@@ -453,7 +460,11 @@ function validateAndBuildRequest() {
     };
 }
 
-async function submitSearch(existingRequest = null) {
+async function submitSearch(existingRequest = null, { isFilterRefresh = false } = {}) {
+    // isFilterRefresh distinguishes a filter/sort-driven re-run of the last
+    // request (loader confined to journeyResults, search button untouched)
+    // from a brand-new "Search journeys" search or a plain retry (loader
+    // spans the results column, search button animates) - see setLoading().
     const baseRequest = existingRequest || validateAndBuildRequest();
     if (!baseRequest) return;
     const request = withServerSort(
@@ -463,17 +474,35 @@ async function submitSearch(existingRequest = null) {
     state.abortController?.abort();
     state.abortController = new AbortController();
     const sequence = ++state.requestSequence;
-    setLoading(true);
+    setLoading(true, { isFilterRefresh });
+    const loadingStartedAt = Date.now();
     try {
         const data = await fetchJourneyPage(request, state.abortController.signal);
+        if (sequence !== state.requestSequence) return;
+        // A filter/sort re-run is often served from a cached, already-ranked
+        // result and can resolve within a single frame - without this, the
+        // loader is replaced before the browser ever paints it. Keep it
+        // visible for a minimum stretch so the update is perceptible.
+        await waitForMinimumLoadingDuration(loadingStartedAt);
         if (sequence !== state.requestSequence) return;
         receiveResults(data, request);
     } catch (error) {
         if (error.name === "AbortError" || sequence !== state.requestSequence) return;
+        await waitForMinimumLoadingDuration(loadingStartedAt);
+        if (sequence !== state.requestSequence) return;
         showError(error.message || "An unexpected error occurred while searching.");
     } finally {
-        if (sequence === state.requestSequence) setLoading(false, true);
+        if (sequence === state.requestSequence) {
+            setLoading(false, { preserveSearchState: true, isFilterRefresh });
+        }
     }
+}
+
+const MIN_LOADING_VISIBLE_MS = 300;
+
+function waitForMinimumLoadingDuration(loadingStartedAt) {
+    const remaining = MIN_LOADING_VISIBLE_MS - (Date.now() - loadingStartedAt);
+    return remaining > 0 ? new Promise(resolve => setTimeout(resolve, remaining)) : Promise.resolve();
 }
 
 async function loadMoreJourneys() {
@@ -515,11 +544,10 @@ async function fetchJourneyPage(request, signal) {
 }
 
 function withJourneyTypeFilter(request) {
-    const options = { ...request.options };
-    const journeyTypes = selectedJourneyTypes();
-    if (journeyTypes.length) options.journeyTypes = journeyTypes;
-    else delete options.journeyTypes;
-    return { ...request, options };
+    return {
+        ...request,
+        options: { ...request.options, journeyTypes: selectedJourneyTypes() }
+    };
 }
 
 function withJourneyPage(request, resultOffset) {
@@ -545,7 +573,7 @@ function withServerSort(request) {
 }
 
 function refreshJourneyTypeFilter() {
-    if (state.lastRequest) submitSearch(state.lastRequest);
+    if (state.lastRequest) submitSearch(state.lastRequest, { isFilterRefresh: true });
 }
 
 async function readResponseBody(response) {
@@ -582,10 +610,11 @@ function receiveResults(data, request, append = false) {
     renderAirlineFilters();
     elements.routeContext.textContent = `${request.origin.label || "Origin"} → ${request.destination.label || "Destination"}`;
     if (!state.journeys.length && !append) {
-        showEmpty(selectedJourneyTypes().length > 0);
+        showEmpty(hasActiveFilters());
         return;
     }
     elements.resultsWorkspace.hidden = false;
+    state.workspaceRevealed = true;
     hideStandaloneStates();
     applyFiltersAndSort();
 }
@@ -696,7 +725,6 @@ function renderJourneyCards() {
             renderShowMoreButton();
             return;
         }
-        elements.resultsWorkspace.hidden = true;
         showEmpty(true);
         return;
     }
@@ -777,7 +805,16 @@ function renderSummary(journey, isFastest) {
         </span>`;
 }
 
-function toggleJourneyDetails(event) {
+function handleResultsClick(event) {
+    if (event.target.closest("[data-inline-retry]")) {
+        submitSearch(state.lastRequest);
+        return;
+    }
+    if (event.target.closest("[data-inline-clear-filters]")) {
+        if (state.journeys.length || hasActiveFilters()) clearFilters();
+        else elements.departureAt.focus();
+        return;
+    }
     const summary = event.target.closest(".journey-summary");
     if (!summary) return;
     const card = summary.closest(".journey-card");
@@ -949,13 +986,13 @@ function toggleQuickFilter(filter) {
 }
 
 function clearFilters() {
-    const hadJourneyTypeFilter = selectedJourneyTypes().length > 0;
+    const hadJourneyTypeFilter = selectedJourneyType() !== DEFAULT_JOURNEY_TYPE;
     const hadNonDefaultSort = elements.sortBy.value !== "transfers";
     resetFilterControls();
     configureTransferFilter();
     closeFilters();
     if ((hadJourneyTypeFilter || hadNonDefaultSort) && state.lastRequest) {
-        submitSearch(state.lastRequest);
+        submitSearch(state.lastRequest, { isFilterRefresh: true });
     }
     else applyFiltersAndSort();
 }
@@ -966,8 +1003,11 @@ function resetFilterControls() {
     document.querySelectorAll("[data-quick-filter]").forEach(button =>
         button.setAttribute("aria-pressed", "false")
     );
-    document.querySelectorAll('input[name="journeyType"], input[name="airline"]')
-        .forEach(input => { input.checked = false; });
+    const defaultJourneyType = document.querySelector(
+        `input[name="journeyType"][value="${DEFAULT_JOURNEY_TYPE}"]`
+    );
+    if (defaultJourneyType) defaultJourneyType.checked = true;
+    document.querySelectorAll('input[name="airline"]').forEach(input => { input.checked = false; });
     for (const input of [
         elements.departureAfter, elements.departureBefore,
         elements.arrivalAfter, elements.arrivalBefore
@@ -978,9 +1018,6 @@ function resetFilterControls() {
 function renderActiveFilters() {
     const chips = [];
     if (state.quickFilter) chips.push({ key: "quick", label: titleCase(state.quickFilter) });
-    document.querySelectorAll('input[name="journeyType"]:checked').forEach(input =>
-        chips.push({ key: `type:${input.value}`, label: journeyTypeFilterLabel(input.value) })
-    );
     if (state.maximumTransferLimit !== null) {
         chips.push({ key: "maxTransfers", label: `Up to ${state.maximumTransferLimit} transfers` });
     }
@@ -1003,7 +1040,6 @@ function removeFilterFromChip(event) {
     const button = event.target.closest("[data-filter-key]");
     if (!button) return;
     const key = button.dataset.filterKey;
-    let serverFilterChanged = false;
     if (key === "quick") {
         state.quickFilter = null;
         document.querySelectorAll("[data-quick-filter]").forEach(item => item.setAttribute("aria-pressed", "false"));
@@ -1011,10 +1047,6 @@ function removeFilterFromChip(event) {
         state.maximumTransferLimit = null;
         elements.maximumTransfers.value = elements.maximumTransfers.max;
         updateMaximumTransfersLabel();
-    } else if (key.startsWith("type:")) {
-        const input = document.querySelector(`input[name="journeyType"][value="${cssEscape(key.slice(5))}"]`);
-        if (input) input.checked = false;
-        serverFilterChanged = true;
     } else if (key.startsWith("airline:")) {
         const value = key.slice(8);
         [...document.querySelectorAll('input[name="airline"]')]
@@ -1022,8 +1054,9 @@ function removeFilterFromChip(event) {
     } else if (elements[key]) {
         elements[key].value = "";
     }
-    if (serverFilterChanged && state.lastRequest) submitSearch(state.lastRequest);
-    else applyFiltersAndSort();
+    // Every remaining chip (quick filter, max transfers, time range, airline)
+    // is a client-side-only filter - no server round-trip is needed.
+    applyFiltersAndSort();
 }
 
 function updateMaximumTransfersLabel() {
@@ -1036,8 +1069,25 @@ function checkedValues(selector) {
     return [...document.querySelectorAll(`${selector}:checked`)].map(input => input.value);
 }
 
+function selectedJourneyType() {
+    return document.querySelector('input[name="journeyType"]:checked')?.value
+        || DEFAULT_JOURNEY_TYPE;
+}
+
 function selectedJourneyTypes() {
-    return checkedValues('input[name="journeyType"]');
+    return JOURNEY_TYPE_SERVER_FILTERS[selectedJourneyType()] || [DEFAULT_JOURNEY_TYPE];
+}
+
+function hasActiveFilters() {
+    return state.quickFilter !== null
+        || state.maximumTransferLimit !== null
+        || Boolean(elements.departureAfter.value)
+        || Boolean(elements.departureBefore.value)
+        || Boolean(elements.arrivalAfter.value)
+        || Boolean(elements.arrivalBefore.value)
+        || checkedValues('input[name="airline"]').length > 0
+        || selectedJourneyType() !== DEFAULT_JOURNEY_TYPE
+        || elements.sortBy.value !== "transfers";
 }
 
 function withinTimeRange(value, after, before) {
@@ -1089,10 +1139,26 @@ function syncFilterPanelAccessibility() {
     else elements.filterPanel.removeAttribute("aria-hidden");
 }
 
-function setLoading(loading, preserveSearchState = false) {
-    elements.searchButton.disabled = loading;
-    elements.searchButton.classList.toggle("is-loading", loading);
+function setLoading(loading, options = {}) {
+    const { preserveSearchState = false, isFilterRefresh = false } = options;
+    // The "Search journeys" button only reflects a brand-new search - a
+    // filter/sort change re-runs the last request without animating it.
+    if (!isFilterRefresh) {
+        elements.searchButton.disabled = loading;
+        elements.searchButton.classList.toggle("is-loading", loading);
+    }
     elements.journeyResults.setAttribute("aria-busy", String(loading));
+    if (state.workspaceRevealed) {
+        // The filter panel stays mounted for every search/filter update after
+        // the first reveal. A new search may refresh the whole results
+        // column (route context, counts, chips, list); a filter/sort change
+        // only shows a loader inside journeyResults itself.
+        if (loading) {
+            if (isFilterRefresh) renderResultsLoading();
+            else renderColumnLoading();
+        }
+        return;
+    }
     if (loading) {
         elements.initialState.hidden = true;
         elements.errorState.hidden = true;
@@ -1105,14 +1171,51 @@ function setLoading(loading, preserveSearchState = false) {
     }
 }
 
+function renderColumnLoading() {
+    elements.resultCount.textContent = "";
+    renderResultsLoading();
+}
+
+function renderResultsLoading() {
+    elements.showMoreButton.hidden = true;
+    elements.journeyResults.replaceChildren();
+    const fragment = document.createDocumentFragment();
+    for (const className of ["skeleton-card", "skeleton-card short"]) {
+        const skeleton = document.createElement("div");
+        skeleton.className = className;
+        fragment.appendChild(skeleton);
+    }
+    elements.journeyResults.appendChild(fragment);
+}
+
 function showError(message) {
+    if (state.workspaceRevealed) {
+        renderInlineError(message);
+        return;
+    }
     hideStandaloneStates();
     elements.resultsWorkspace.hidden = true;
     elements.errorMessage.textContent = message;
     elements.errorState.hidden = false;
 }
 
+function renderInlineError(message) {
+    elements.showMoreButton.hidden = true;
+    elements.resultCount.textContent = "";
+    elements.journeyResults.innerHTML = `
+        <div class="state-card error-state">
+            <div class="state-icon" aria-hidden="true">!</div>
+            <h2>We couldn’t load journeys</h2>
+            <p>${escapeHtml(message)}</p>
+            <button type="button" class="primary-button compact" data-inline-retry>Try again</button>
+        </div>`;
+}
+
 function showEmpty(filtered) {
+    if (state.workspaceRevealed) {
+        renderInlineEmpty(filtered);
+        return;
+    }
     hideStandaloneStates();
     elements.resultsWorkspace.hidden = true;
     elements.emptyTitle.textContent = filtered ? "No journeys match these filters" : "No journeys found";
@@ -1121,6 +1224,23 @@ function showEmpty(filtered) {
         : "Try a different departure time or choose nearby locations.";
     elements.emptyActionButton.textContent = filtered ? "Clear filters" : "Change search";
     elements.emptyState.hidden = false;
+}
+
+function renderInlineEmpty(filtered) {
+    elements.showMoreButton.hidden = true;
+    elements.resultCount.textContent = "0 journeys found";
+    const title = filtered ? "No journeys match these filters" : "No journeys found";
+    const message = filtered
+        ? "Clear one or more filters to see other available routes."
+        : "Try a different departure time or choose nearby locations.";
+    const actionLabel = filtered ? "Clear filters" : "Change search";
+    elements.journeyResults.innerHTML = `
+        <div class="state-card">
+            <div class="state-icon" aria-hidden="true">⌁</div>
+            <h2>${escapeHtml(title)}</h2>
+            <p>${escapeHtml(message)}</p>
+            <button type="button" class="secondary-button" data-inline-clear-filters>${escapeHtml(actionLabel)}</button>
+        </div>`;
 }
 
 function hideStandaloneStates() {
@@ -1174,13 +1294,6 @@ function formatDistance(value) {
     return `${distance < 10 ? distance.toFixed(1) : Math.round(distance)} km`;
 }
 
-function journeyTypeFilterLabel(value) {
-    return ({
-        RAIL_ONLY: "Train only", FLIGHT_ONLY: "Flight only",
-        RAIL_TO_FLIGHT: "Train → Flight", FLIGHT_TO_RAIL: "Flight → Train"
-    })[value] || titleCase(value);
-}
-
 function titleCase(value) {
     return String(value).replace(/_/g, " ").replace(/\b\w/g, letter => letter.toUpperCase());
 }
@@ -1196,10 +1309,6 @@ function safeTimestamp(value) {
 
 function safeId(value) {
     return String(value).replace(/[^a-zA-Z0-9_-]/g, "-");
-}
-
-function cssEscape(value) {
-    return window.CSS?.escape ? window.CSS.escape(value) : String(value).replace(/["\\]/g, "\\$&");
 }
 
 function escapeHtml(value) {

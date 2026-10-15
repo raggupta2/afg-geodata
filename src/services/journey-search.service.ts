@@ -187,7 +187,7 @@ function buildOption(
     clock: RailwaySearchClock,
     policy: JourneyRoutingPolicy,
     departureAtIsTrainThreshold = false
-): JourneySearchOption {
+): JourneySearchOption | null {
     const dateOnlySearch = request.departureDate !== undefined;
     const flexibleOriginTiming = dateOnlySearch
         || departureAtIsTrainThreshold;
@@ -220,14 +220,46 @@ function buildOption(
         0,
         railwayElapsedMinutes - trainInVehicleMinutes
     );
+    // In flexibleOriginTiming mode the boarding time is fixed by the found
+    // train, and the local-access leg is computed backward from it: leave
+    // late enough to still catch the train, but no later than necessary. If
+    // that backward calculation would place the departure before the instant
+    // the traveler said they'd be ready (clock.requestedMinute), leaving that
+    // early is not physically possible - the actual journey start is then
+    // clock.requestedMinute itself, the earliest the traveler can move, and
+    // the road-access/boarding-buffer legs are computed forward from it using
+    // their real, un-hidden durations (source.roadTravelMinutes), rather than
+    // collapsing every leg to the train's own departure time. Multiple
+    // candidates can legitimately tie on this readiness floor - they are all
+    // equally bound by when the traveler can leave - and remain distinguished
+    // by their (still schedule-derived) arrival times and durations.
+    const naturalStationArrivalMinute = path.departureMinute
+        - policy.initialRailBufferMinutes;
+    const naturalSourceDepartureMinute = naturalStationArrivalMinute
+        - source.roadTravelMinutes;
     const sourceDepartureMinute = flexibleOriginTiming
-        ? path.departureMinute
-            - policy.initialRailBufferMinutes
-            - source.roadTravelMinutes
+        ? Math.max(naturalSourceDepartureMinute, clock.requestedMinute)
         : clock.requestedMinute;
     const stationArrivalMinute = flexibleOriginTiming
-        ? path.departureMinute - policy.initialRailBufferMinutes
+        ? sourceDepartureMinute + source.roadTravelMinutes
         : source.stationArrivalMinute;
+    // The readiness floor above guarantees sourceDepartureMinute is never
+    // shown before clock.requestedMinute, but says nothing about whether
+    // the traveler can still physically reach THIS station in time for
+    // THIS train once forced that late - road access from a farther
+    // station can eat past the train's own departure, arriving at the
+    // platform after it already left. The provider's own admissibility
+    // bound only checks path.departureMinute >= clock.requestedMinute (a
+    // road-access-blind threshold - see the readyMinute computation this
+    // candidate's source.readyMinute came from), so it does not catch
+    // this. Discarding the candidate here - rather than clamping
+    // BOARDING_WAIT's Math.max(0, ...) to a deceptive 0m - is the only
+    // correct outcome: unlike the readiness floor, arriving late is not a
+    // display choice, it is this candidate genuinely not being reachable
+    // by this traveler from this station for this train.
+    if (flexibleOriginTiming && stationArrivalMinute > path.departureMinute) {
+        return null;
+    }
     const readyMinute = flexibleOriginTiming
         ? path.departureMinute
         : source.readyMinute;
@@ -366,14 +398,16 @@ function buildOption(
         railwayElapsedMinutes,
         trainInVehicleMinutes,
         railTransferWaitingMinutes,
-        totalJourneyMinutes: flexibleOriginTiming
-            ? source.roadTravelMinutes
-                + policy.initialRailBufferMinutes
-                + railwayElapsedMinutes
-                + destinationAccess.travelMinutes
-            : path.arrivalMinute
-                - clock.requestedMinute
-                + destinationAccess.travelMinutes,
+        // Derived directly from the (possibly snapped, see above)
+        // sourceDepartureMinute rather than re-summed from the individual
+        // components, so it always exactly matches finalArrivalAt minus the
+        // displayed departureAt regardless of which branch produced
+        // sourceDepartureMinute - equivalent to the previous per-branch
+        // formulas in the ordinary case, and automatically correct in the
+        // no-lead-time case that those formulas got wrong.
+        totalJourneyMinutes: path.arrivalMinute
+            + destinationAccess.travelMinutes
+            - sourceDepartureMinute,
         numberOfTransfers: Math.max(0, trainGroups.length - 1),
         legs
     };
@@ -385,14 +419,25 @@ function railLegs(option: JourneySearchOption): RailJourneyLeg[] {
     );
 }
 
+// totalJourneyMinutes is computed backward from each candidate's OWN boarding
+// stop, so boarding the same train further downstream always shows less
+// in-vehicle time - which can make it look "faster" than a candidate that
+// needs no road access at all, even though it only appears shorter because
+// part of the trip moved from rail to road. Comparing total road-access
+// minutes before raw duration ensures a candidate that needs no local
+// transport is never outranked, by duration alone, by one that does.
+function totalRoadAccessMinutes(option: JourneySearchOption): number {
+    return option.sourceAccess.travelMinutes + option.destinationAccess.travelMinutes;
+}
+
 function compareJourneyOptions(
     left: JourneySearchOption,
     right: JourneySearchOption,
     sortBy: JourneySortOrder = "transfers"
 ): number {
     const tieBreak = left.numberOfTransfers - right.numberOfTransfers
+        || totalRoadAccessMinutes(left) - totalRoadAccessMinutes(right)
         || left.totalJourneyMinutes - right.totalJourneyMinutes
-        || left.sourceAccess.travelMinutes - right.sourceAccess.travelMinutes
         || left.preTrainWaitingMinutes - right.preTrainWaitingMinutes
         || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt)
         || left.railTransferWaitingMinutes
@@ -401,8 +446,8 @@ function compareJourneyOptions(
         return left.totalJourneyMinutes - right.totalJourneyMinutes || tieBreak;
     }
     if (sortBy === "departure") {
-        return Date.parse(left.firstTrainDepartureAt)
-            - Date.parse(right.firstTrainDepartureAt) || tieBreak;
+        return Date.parse(suggestedLeaveHomeAt(left))
+            - Date.parse(suggestedLeaveHomeAt(right)) || tieBreak;
     }
     if (sortBy === "arrival") {
         return Date.parse(left.finalArrivalAt)
@@ -411,8 +456,56 @@ function compareJourneyOptions(
     return left.numberOfTransfers - right.numberOfTransfers || tieBreak;
 }
 
+// Shared by downstreamContinuationKey() (the full ride) and
+// pruneSelfDefeatingFirstLegs() below (a candidate's OWN ride minus its
+// first leg) - identifies a sequence of train legs by every train ridden,
+// every transfer point, and the final alighting station, regardless of
+// where the FIRST of these legs was boarded from.
+function continuationKeyFromLegs(trains: RailJourneyLeg[]): string {
+    const alightingStationKey = trains[trains.length - 1].to.id
+        ?? trains[trains.length - 1].to.code;
+    const services = trains.map(
+        leg => `${leg.trainNumber}@${leg.serviceDate}`
+    );
+    const transfers = trains.slice(0, -1).map(
+        (leg, index) =>
+            `${leg.to.id ?? leg.to.code}>${trains[index + 1].from.id
+                ?? trains[index + 1].from.code}`
+    );
+    return [
+        trains.length <= 1 ? "DIRECT" : "TRANSFER",
+        alightingStationKey,
+        ...services,
+        ...transfers
+    ].join("|");
+}
+
+// Identifies the downstream continuation an option rides - every train
+// boarded from the first leg onward, every transfer point, and the final
+// alighting station - without regard to which station the first train was
+// boarded from. Two options sharing this key ride the exact same physical
+// service chain to the same destination and differ only in local access to
+// their (possibly different) boarding station on the first train.
+function downstreamContinuationKey(option: JourneySearchOption): string {
+    return continuationKeyFromLegs(railLegs(option));
+}
+
 function itineraryKey(option: JourneySearchOption): string {
     const trains = railLegs(option);
+    const boardingStationKey = trains[0].from.id ?? trains[0].from.code;
+    return `${boardingStationKey}|${downstreamContinuationKey(option)}`;
+}
+
+// The mirror image of downstreamContinuationKey(): identifies the boarding
+// side of an option - the boarding station, every train and transfer point
+// up to and including the LAST train's own identity - without regard to
+// where that last train was alighted from. Two options sharing this key
+// board the exact same sequence of services and differ only in which stop
+// of the final train they get off at (and therefore in the local-access
+// leg needed to complete the journey to the real destination from there).
+function upstreamServiceChainKey(option: JourneySearchOption): string {
+    const trains = railLegs(option);
+    const boardingStationKey = trains[0].from.id ?? trains[0].from.code;
     const services = trains.map(
         leg => `${leg.trainNumber}@${leg.serviceDate}`
     );
@@ -423,9 +516,136 @@ function itineraryKey(option: JourneySearchOption): string {
     );
     return [
         option.numberOfTransfers === 0 ? "DIRECT" : "TRANSFER",
+        boardingStationKey,
         ...services,
         ...transfers
     ].join("|");
+}
+
+// A same-train continuation is identical no matter which of its stops it is
+// boarded from - the train reaches every downstream stop, including the
+// final destination, at the same time regardless. So boarding it from a
+// station upstream of another available boarding station on the SAME
+// service chain never arrives any sooner, and only ever adds local-access
+// time - a pure, avoidable detour/backtrack (AGENTS.md Practicality:
+// "Backtracking", "Unnecessary detours"), not a real alternative. Discard
+// candidate A only when another candidate B rides the identical downstream
+// continuation (downstreamContinuationKey matches) but boards the first
+// train later - i.e. at a station strictly downstream of A's boarding
+// station - while requiring no more local access to reach it. Candidates
+// requiring MORE local access than every later boarding option are kept:
+// this only removes detours that are strictly no better in every respect,
+// never a candidate that trades more access time for something else.
+function pruneUpstreamBoardingDetours(
+    options: JourneySearchOption[]
+): JourneySearchOption[] {
+    // Grouping by key once up front, rather than recomputing
+    // downstreamContinuationKey(other) for every (candidate, other) pair,
+    // turns this from an O(n^2) pass of string-building work into O(n) -
+    // see pruneSelfDefeatingFirstLegs() below, where the same redundant
+    // recomputation measured 40-60s on a real, large candidate pool.
+    const byKey = new Map<string, JourneySearchOption[]>();
+    for (const option of options) {
+        const key = downstreamContinuationKey(option);
+        const group = byKey.get(key);
+        if (group) group.push(option);
+        else byKey.set(key, [option]);
+    }
+    return options.filter(candidate => {
+        const key = downstreamContinuationKey(candidate);
+        const candidateBoardMs = Date.parse(candidate.firstTrainDepartureAt);
+        return !byKey.get(key)?.some(other =>
+            other !== candidate
+            && Date.parse(other.firstTrainDepartureAt) > candidateBoardMs
+            && other.sourceAccess.travelMinutes
+                <= candidate.sourceAccess.travelMinutes
+        );
+    });
+}
+
+// Mirror image of pruneUpstreamBoardingDetours(), for the alighting side:
+// the same physical last train passes through every one of its own
+// downstream stops regardless of where it is alighted from, so getting off
+// EARLIER than another available alighting stop on that same train - and
+// completing the trip to the real destination by local access from there -
+// never arrives sooner and only ever adds unneeded local-access time.
+// Discard candidate A only when another candidate B boards the identical
+// service chain (upstreamServiceChainKey matches - same boarding station,
+// same trains, same transfer points) but alights from the final train
+// later - i.e. at a stop strictly downstream of A's alighting stop - while
+// requiring no more local access to complete the journey from there.
+function pruneUpstreamAlightingDetours(
+    options: JourneySearchOption[]
+): JourneySearchOption[] {
+    // Same O(n^2) -> O(n) fix as pruneUpstreamBoardingDetours() above:
+    // group by key once instead of recomputing upstreamServiceChainKey(other)
+    // for every (candidate, other) pair.
+    const byKey = new Map<string, JourneySearchOption[]>();
+    for (const option of options) {
+        const key = upstreamServiceChainKey(option);
+        const group = byKey.get(key);
+        if (group) group.push(option);
+        else byKey.set(key, [option]);
+    }
+    return options.filter(candidate => {
+        const key = upstreamServiceChainKey(candidate);
+        const candidateAlightMs = Date.parse(candidate.finalTrainArrivalAt);
+        return !byKey.get(key)?.some(other =>
+            other !== candidate
+            && Date.parse(other.finalTrainArrivalAt) > candidateAlightMs
+            && other.destinationAccess.travelMinutes
+                <= candidate.destinationAccess.travelMinutes
+        );
+    });
+}
+
+// Neither pruneUpstreamBoardingDetours() nor pruneUpstreamAlightingDetours()
+// catch a candidate that rides an entirely different, throwaway FIRST train
+// before continuing onward - e.g. drive to a farther station, board a train
+// back to (or through) a station the traveler could have boarded directly
+// from, then continue from there via trains that were reachable from the
+// true origin all along. Both existing prunes only compare options riding
+// the IDENTICAL continuation (same downstreamContinuationKey/
+// upstreamServiceChainKey); this candidate's continuation includes one
+// extra leg the alternative doesn't, so it never matches either key. Catch
+// it by comparing a candidate's OWN remaining continuation - its full ride
+// with the first leg dropped - against every OTHER candidate's full
+// continuation: if some other candidate reaches that exact same remaining
+// journey (same trains, same transfer points, same final alighting) with
+// no worse local access than this candidate's own first-leg boarding
+// required, the first leg added nothing but a pointless detour, and this
+// candidate is discarded. A continuationKeyFromLegs() match on train
+// number + serviceDate guarantees the SAME calendar-day run of every
+// remaining train, so the matched alternative's final arrival is
+// identical - this can only ever remove a candidate, never disadvantage
+// one that trades access time for something else.
+function pruneSelfDefeatingFirstLegs(
+    options: JourneySearchOption[]
+): JourneySearchOption[] {
+    // Recomputing downstreamContinuationKey(other) inside the candidate
+    // loop (once per (candidate, other) pair) turned this into an O(n^2)
+    // pass of non-trivial string-building work - measured at 40-60s on a
+    // real multi-transfer route with a large candidate pool. Computing
+    // every option's own key exactly once up front, then looking candidates
+    // up by that key, keeps the same comparisons (same result) at O(n).
+    const byDownstreamKey = new Map<string, JourneySearchOption[]>();
+    for (const option of options) {
+        const key = downstreamContinuationKey(option);
+        const group = byDownstreamKey.get(key);
+        if (group) group.push(option);
+        else byDownstreamKey.set(key, [option]);
+    }
+    return options.filter(candidate => {
+        const trains = railLegs(candidate);
+        if (trains.length < 2) return true;
+        const tailKey = continuationKeyFromLegs(trains.slice(1));
+        const matches = byDownstreamKey.get(tailKey);
+        return !matches?.some(other =>
+            other !== candidate
+            && other.sourceAccess.travelMinutes
+                <= candidate.sourceAccess.travelMinutes
+        );
+    });
 }
 
 function trainSummaries(option: JourneySearchOption): TrainServiceSummary[] {
@@ -540,6 +760,27 @@ function groupJourneyOptions(
                 && leg.transferType === "RAIL_TRANSFER"
         );
         const overallScoreMinutes = recommended.totalJourneyMinutes;
+        // groupOptions itself never has more than one distinct boarding or
+        // alighting station - itineraryKey (the Map key above) is boarding-
+        // and-alighting-specific, on purpose, so each boarding-station
+        // variant of a train surfaces as its own visible trainResults entry
+        // rather than being silently folded into another station's "best"
+        // pick (see the direct-boarding-train-hidden fix this guarded
+        // against). availableDestinationStations/alternativeBoardingStations
+        // are informational cross-references to those OTHER, separately
+        // visible entries, so they need the full candidate pool scoped by
+        // the boarding-agnostic/alighting-agnostic key instead - the same
+        // scoping pruneUpstreamBoardingDetours/pruneUpstreamAlightingDetours
+        // already use to decide which boarding/alighting variants of the
+        // same continuation are genuine (non-dominated) alternatives.
+        const sameUpstreamChain = options.filter(option =>
+            upstreamServiceChainKey(option)
+                === upstreamServiceChainKey(recommended)
+        );
+        const sameDownstreamContinuation = options.filter(option =>
+            downstreamContinuationKey(option)
+                === downstreamContinuationKey(recommended)
+        );
         results.push({
             key,
             options: groupOptions,
@@ -563,9 +804,9 @@ function groupJourneyOptions(
                 suggestedLeaveHomeAt: suggestedLeaveHomeAt(recommended),
                 firstTrainDepartureAt: recommended.firstTrainDepartureAt,
                 availableDestinationStations:
-                    availableDestinations(groupOptions),
+                    availableDestinations(sameUpstreamChain),
                 alternativeBoardingStations:
-                    alternativeBoardings(groupOptions, recommended),
+                    alternativeBoardings(sameDownstreamContinuation, recommended),
                 transferDetails,
                 finalTrainArrivalAt: recommended.finalTrainArrivalAt,
                 finalArrivalAt: recommended.finalArrivalAt,
@@ -741,7 +982,8 @@ async function executeCoordinateRailwayJourneySearch(
     const providerResult = await searchRailwayProvider(
         sourceTimings.map(source => ({
             stationId: source.station.id,
-            readyMinute: source.readyMinute
+            readyMinute: source.readyMinute,
+            roadAccessMinutes: source.roadTravelMinutes
         })),
         new Set(destinationStations.map(station => station.id)),
         clock.serviceDate,
@@ -776,7 +1018,9 @@ async function executeCoordinateRailwayJourneySearch(
                 - left.boardingStation.activeTrainCount
         );
     const groupedJourneys = groupJourneyOptions(
-        allOptions,
+        pruneSelfDefeatingFirstLegs(
+            pruneUpstreamAlightingDetours(pruneUpstreamBoardingDetours(allOptions))
+        ),
         request.options.sortBy
     );
     const selectedGroups = groupedJourneys.slice(

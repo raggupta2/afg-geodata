@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Session Handoff (CHANGELOG.md)
+
+This project is worked on by different agents (Claude Code, Codex) and
+accounts. `CHANGELOG.md` is the shared source of truth for current status.
+
+- Before starting any work, read `CHANGELOG.md` for current status and next
+  steps. Do not assume the previous session's state from memory, since a
+  different agent (Claude or Codex) may have made the last change.
+- Before ending a session — whether a phase finished or the session is
+  stopping for any other reason (e.g. a token/usage limit) — append a dated
+  entry to `CHANGELOG.md` summarizing what changed and what's next, and update
+  its "Current status" section. This applies even if the current phase isn't
+  complete yet.
+
 ## Durable Project Memory
 
 Before changing or investigating this repository, read

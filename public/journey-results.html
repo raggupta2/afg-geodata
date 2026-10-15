@@ -136,20 +136,16 @@
                 <fieldset class="filter-section">
                     <legend>Journey type</legend>
                     <label class="check-row">
-                        <input type="checkbox" name="journeyType" value="RAIL_ONLY" checked>
+                        <input type="radio" name="journeyType" value="RAIL_ONLY" checked>
                         <span>Train only</span>
                     </label>
                     <label class="check-row">
-                        <input type="checkbox" name="journeyType" value="FLIGHT_ONLY">
+                        <input type="radio" name="journeyType" value="FLIGHT_ONLY">
                         <span>Flight only</span>
                     </label>
                     <label class="check-row">
-                        <input type="checkbox" name="journeyType" value="RAIL_TO_FLIGHT">
-                        <span>Train → Flight</span>
-                    </label>
-                    <label class="check-row">
-                        <input type="checkbox" name="journeyType" value="FLIGHT_TO_RAIL">
-                        <span>Flight → Train</span>
+                        <input type="radio" name="journeyType" value="MIXED">
+                        <span>Mixed <span class="label-hint">(train ⇄ flight)</span></span>
                     </label>
                 </fieldset>
 

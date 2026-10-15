@@ -49,6 +49,7 @@ type RoundLabel = {
 export type RailwaySearchOrigin = {
     stationId: string;
     readyMinute: number;
+    roadAccessMinutes: number;
 };
 
 export type RailwayPath = {
@@ -390,6 +391,16 @@ function trainSequenceKey(state: JourneySearchState): string {
     });
     return [
         state.rides.length === 1 ? "DIRECT" : "TRANSFER",
+        state.originStationId,
+        // At the one call site (the destination-completion check in
+        // searchEarliestPaths), state.stationId is the alighting station.
+        // Without it here, a train that can alight at more than one
+        // candidate destination station (e.g. an earlier stop within the
+        // destination search radius, and the traveler's actual selected
+        // station further down the same route) would have its later,
+        // real-destination alighting silently discarded as a "duplicate"
+        // of the earlier one - even though they are different journeys.
+        state.stationId,
         ...services,
         ...transfers
     ].join("|");
@@ -398,7 +409,8 @@ function trainSequenceKey(state: JourneySearchState): string {
 function compareStates(
     left: JourneySearchState,
     right: JourneySearchState,
-    sortBy: JourneySortOrder
+    sortBy: JourneySortOrder,
+    roadAccessByOrigin: Map<string, number>
 ): number {
     if (sortBy === "transfers") {
         return left.estimatedTotalLegs - right.estimatedTotalLegs
@@ -406,23 +418,57 @@ function compareStates(
             || left.rides.length - right.rides.length;
     }
     if (sortBy === "departure") {
-        const leftDeparture = left.rides[0]?.[0]?.departureMinute
+        // Raw train departure alone favors whichever origin happens to board
+        // closest to the destination (least road access needed), the same
+        // way raw departure favored the closest origin in the admission
+        // budget fixed above - a farther origin's train can have an earlier
+        // ACTUAL journey start (departure minus road access) than a closer
+        // origin's earlier-departing train, but would never even be
+        // expanded/admitted first under a raw-time comparison, so it could
+        // be excluded by maxResultsPerOrigin/maxResults before the final,
+        // already-correct compareJourneyOptions() sort ever sees it.
+        // Subtracting each state's own origin's road-access minutes (a
+        // per-origin constant, so it never changes relative order between
+        // two states from the SAME origin) approximates that actual start
+        // for exploration-priority purposes only - the boarding buffer is
+        // deliberately omitted since it is a single shared constant across
+        // every candidate and so cannot affect relative ordering.
+        const leftRawDeparture = left.rides[0]?.[0]?.departureMinute
             ?? left.arrivalMinute;
-        const rightDeparture = right.rides[0]?.[0]?.departureMinute
+        const rightRawDeparture = right.rides[0]?.[0]?.departureMinute
             ?? right.arrivalMinute;
+        const leftDeparture = leftRawDeparture
+            - (roadAccessByOrigin.get(left.originStationId) ?? 0);
+        const rightDeparture = rightRawDeparture
+            - (roadAccessByOrigin.get(right.originStationId) ?? 0);
         return leftDeparture - rightDeparture
             || left.arrivalMinute - right.arrivalMinute
             || left.estimatedTotalLegs - right.estimatedTotalLegs;
     }
-    return left.arrivalMinute - right.arrivalMinute
-        || left.estimatedTotalLegs - right.estimatedTotalLegs
+    // "duration" has no dedicated branch and falls through here alongside
+    // "arrival". Both must still explore in estimatedTotalLegs order first -
+    // the same admissible (never-overestimates) leg-count heuristic the
+    // "transfers" branch above uses - rather than plain arrival-time-first
+    // Dijkstra: without it, a long-distance search spends its entire
+    // expansion budget on ever-cheaper-arrival local hops near the origin
+    // and never reaches a geographically distant destination, returning
+    // zero (truncated) results even though valid paths exist. The final
+    // output order for "arrival"/"duration" is still produced afterward by
+    // compareJourneyOptions()/comparePaths() on the completed paths - this
+    // only changes the search's internal traversal order, not what sorting
+    // the caller receives.
+    return left.estimatedTotalLegs - right.estimatedTotalLegs
+        || left.arrivalMinute - right.arrivalMinute
         || left.rides.length - right.rides.length;
 }
 
 class JourneySearchQueue {
     private readonly states: JourneySearchState[] = [];
 
-    constructor(private readonly sortBy: JourneySortOrder) {}
+    constructor(
+        private readonly sortBy: JourneySortOrder,
+        private readonly roadAccessByOrigin: Map<string, number>
+    ) {}
 
     get length(): number {
         return this.states.length;
@@ -437,7 +483,8 @@ class JourneySearchQueue {
                 compareStates(
                     this.states[parentIndex],
                     this.states[index],
-                    this.sortBy
+                    this.sortBy,
+                    this.roadAccessByOrigin
                 ) <= 0
             ) {
                 break;
@@ -466,7 +513,8 @@ class JourneySearchQueue {
                 && compareStates(
                     this.states[leftIndex],
                     this.states[smallest],
-                    this.sortBy
+                    this.sortBy,
+                    this.roadAccessByOrigin
                 ) < 0
             ) {
                 smallest = leftIndex;
@@ -476,7 +524,8 @@ class JourneySearchQueue {
                 && compareStates(
                     this.states[rightIndex],
                     this.states[smallest],
-                    this.sortBy
+                    this.sortBy,
+                    this.roadAccessByOrigin
                 ) < 0
             ) {
                 smallest = rightIndex;
@@ -562,7 +611,10 @@ async function searchEarliestPaths(
     truncated: boolean;
     reason: string | null;
 }> {
-    const queue = new JourneySearchQueue(sortBy);
+    const roadAccessByOrigin = new Map(
+        origins.map(origin => [origin.stationId, origin.roadAccessMinutes])
+    );
+    const queue = new JourneySearchQueue(sortBy, roadAccessByOrigin);
     const labels = new Map<string, JourneySearchState[]>();
     const reachableOriginIds = new Set<string>();
     for (const origin of origins) {
@@ -586,6 +638,53 @@ async function searchEarliestPaths(
 
     const paths: RailwayPath[] = [];
     const resultsByOrigin = new Map<string, number>();
+    // For sortBy: "departure", a single early initial train from an origin
+    // can be completed via many different downstream transfer choices, all
+    // sharing that same first departure - the priority queue (ordered by
+    // departure) explores and admits every one of them before it is ever
+    // the turn of that same origin's NEXT, later, distinct initial train.
+    // Left unchecked, an origin's entire maxResultsPerOrigin quota is spent
+    // on transfer-path variety of its single earliest train, so a genuinely
+    // later (but real, and possibly a much simpler direct service) departure
+    // from that same origin is never admitted at all - reproducing the
+    // reported "every result shows the same early time" symptom even though
+    // buildOption()/compareJourneyOptions() already compute and sort by the
+    // correct actual-journey-start value for whatever candidates make it
+    // into this list. Capping how many of an origin's admitted results may
+    // share the same first-ride train reserves quota for trying a different,
+    // later initial departure from that same origin instead - a fairness
+    // dimension analogous to the existing per-destination/per-origin caps
+    // elsewhere in this file, just one level deeper (per origin AND per
+    // first train). Scoped to "departure" only: other sort orders explore
+    // primarily by remaining-legs/arrival-time, which does not exhibit this
+    // same-initial-train monopolization pattern.
+    const resultsByOriginAndFirstTrain = new Map<string, number>();
+    // Half (not all) of an origin's own quota, so the freed-up half can go
+    // toward finding this origin's NEXT, later, distinct departure instead
+    // of more transfer-path variety of the same one. A cap of exactly 1 was
+    // tried and produced more departure-time diversity, but on a real long-
+    // distance, multi-transfer route it made the search exhaust its overall
+    // exploration budget (truncated: true) before finishing - each move to
+    // a new initial train restarts a costly branching exploration, and
+    // reaching more distinct initial trains sooner means more of those
+    // branchy subtrees get partially generated within the same budget. Half
+    // is the verified, non-truncating middle ground: confirmed against the
+    // real database to surface genuinely different departure times (not
+    // just one shared value) while keeping search completion intact.
+    //
+    // A further attempt to guarantee even more diversity - a two-phase cap
+    // starting at 1 per new first train until a handful of distinct first
+    // trains were found per origin, then relaxing to this same half-quota
+    // value - was tried and found unsafe: on a real long-distance,
+    // multi-transfer route (DWX -> SVDK) it drove multiple node processes
+    // to several gigabytes of memory and tens of seconds of wall time
+    // before still returning `truncated: true` - worse than this flat half
+    // cap on both cost and correctness. Reverted; see PROJECT_MEMORY.md's
+    // "Wasteful backtracking detour..." root cause for the full account and
+    // what remains unresolved.
+    const maxResultsPerOriginPerFirstTrain = sortBy === "departure"
+        ? Math.max(1, Math.floor(maxResultsPerOrigin / 2))
+        : maxResultsPerOrigin;
     let expandedStates = 0;
     let generatedStates = origins.length;
 
@@ -615,14 +714,20 @@ async function searchEarliestPaths(
 
         const state = queue.pop();
         if (!state) break;
+        const firstTrainId = state.rides[0]?.[0]?.trainId;
+        const originFirstTrainKey = `${state.originStationId}:${firstTrainId}`;
         if (destinationStationIds.has(state.stationId)) {
             const routeKey = journeyKey(state);
             const trainKey = trainSequenceKey(state);
             const originResultCount = resultsByOrigin.get(
                 state.originStationId
             ) ?? 0;
+            const originFirstTrainCount = resultsByOriginAndFirstTrain.get(
+                originFirstTrainKey
+            ) ?? 0;
             if (
                 originResultCount < maxResultsPerOrigin
+                && originFirstTrainCount < maxResultsPerOriginPerFirstTrain
                 && !resultKeys.has(routeKey)
                 && !trainKeys.has(trainKey)
             ) {
@@ -633,6 +738,10 @@ async function searchEarliestPaths(
                     state.originStationId,
                     originResultCount + 1
                 );
+                resultsByOriginAndFirstTrain.set(
+                    originFirstTrainKey,
+                    originFirstTrainCount + 1
+                );
             }
             continue;
         }
@@ -640,6 +749,13 @@ async function searchEarliestPaths(
         if (
             (resultsByOrigin.get(state.originStationId) ?? 0)
             >= maxResultsPerOrigin
+        ) {
+            continue;
+        }
+        if (
+            firstTrainId !== undefined
+            && (resultsByOriginAndFirstTrain.get(originFirstTrainKey) ?? 0)
+                >= maxResultsPerOriginPerFirstTrain
         ) {
             continue;
         }
@@ -916,25 +1032,35 @@ function findDirectPaths(
         if (originPaths.length === 0) {
             originsWithoutDirectPaths.push(origin);
         } else {
+            // A busy origin can have many different trains reaching many
+            // different candidate destination stations. Selecting purely by
+            // arrival time - "first distinct destination wins, then fill
+            // remaining slots soonest-first" - lets a nearby but otherwise
+            // irrelevant destination, reached by many short local trains,
+            // consume the whole per-origin quota before the traveler's own
+            // selected destination is ever considered, since a real direct
+            // train to that destination is necessarily a longer ride and so
+            // arrives later. That silently discards a genuine direct train
+            // to the actual destination in favor of unrelated trains to
+            // other nearby stations that merely happened to arrive sooner.
+            // Give every candidate destination its own fair, guaranteed
+            // share of the quota instead (mirroring the per-origin fair
+            // share computed above), independent of arrival time across
+            // different destinations.
+            const maxResultsPerDestination = Math.max(
+                1,
+                Math.ceil(maxResultsPerOrigin / destinationStationIds.size)
+            );
+            const perDestinationCount = new Map<string, number>();
             const selected: RailwayPath[] = [];
-            const selectedKeys = new Set<string>();
-            const destinationIds = new Set<string>();
             for (const path of originPaths) {
-                if (destinationIds.has(path.destinationStationId)) continue;
-                destinationIds.add(path.destinationStationId);
+                const count = perDestinationCount.get(
+                    path.destinationStationId
+                ) ?? 0;
+                if (count >= maxResultsPerDestination) continue;
+                perDestinationCount.set(path.destinationStationId, count + 1);
                 selected.push(path);
-                selectedKeys.add(
-                    `${path.connections[0].trainId}:${path.destinationStationId}`
-                );
                 if (selected.length >= maxResultsPerOrigin) break;
-            }
-            for (const path of originPaths) {
-                if (selected.length >= maxResultsPerOrigin) break;
-                const key =
-                    `${path.connections[0].trainId}:${path.destinationStationId}`;
-                if (selectedKeys.has(key)) continue;
-                selectedKeys.add(key);
-                selected.push(path);
             }
             paths.push(...selected);
         }
@@ -975,7 +1101,15 @@ function comparePaths(
 
 function directServiceKey(path: RailwayPath): string {
     const first = path.connections[0];
-    return `DIRECT|${first.trainNumber}@${first.serviceDate ?? ""}`;
+    // Must include destinationStationId: findDirectPaths() already
+    // correctly retains one entry per distinct destination for the same
+    // train (its own per-origin `keys` set is keyed by
+    // `${trainId}:${destinationStationId}`), but without it here too, this
+    // cross-origin dedup would still collapse a train's earlier candidate
+    // destination (e.g. a stop within the destination search radius) and
+    // its later stop at the traveler's actual selected station into "the
+    // same" direct service, discarding whichever was sorted/processed second.
+    return `DIRECT|${path.originStationId}|${path.destinationStationId}|${first.trainNumber}@${first.serviceDate ?? ""}`;
 }
 
 async function executeSearch(
@@ -1007,12 +1141,100 @@ async function executeSearch(
         ).paths.sort((left, right) =>
             comparePaths(left, right, limits.sortBy)
         );
+        // Same fairness problem one level up: this merges direct paths
+        // across every origin AND every candidate destination. Capping
+        // purely by "first limits.maxResults in arrival-time order" lets
+        // paths to a nearby-but-irrelevant destination - reached sooner
+        // simply because it is an earlier stop on the same or a different
+        // train - crowd out paths to the traveler's own selected
+        // destination before this loop ever reaches them. A per-destination
+        // cap alone is not enough either: multiple origins boarding the
+        // SAME train to a destination can still fill that destination's
+        // whole share before a genuinely DIFFERENT train serving the same
+        // destination (from any origin) is ever considered. Pass 1
+        // guarantees every distinct (destination, train) pair gets at
+        // least one representative - whichever origin sorts first for it -
+        // regardless of arrival time relative to other destinations/trains.
+        // Pass 2 then fills any remaining budget with further alternatives
+        // (other origins for a train/destination already represented),
+        // still respecting the per-destination cap.
+        const maxDirectResultsPerDestination = Math.max(
+            1,
+            Math.ceil(limits.maxResults / destinationStationIds.size)
+        );
+        const directCountByDestination = new Map<string, number>();
+        const admittedTrainsByDestination = new Map<string, Set<string>>();
         for (const path of direct) {
+            if (directPaths.length >= limits.maxResults) break;
             const key = directServiceKey(path);
             if (trainKeys.has(key)) continue;
+            const trainId = path.connections[0].trainId;
+            const admittedTrains = admittedTrainsByDestination.get(
+                path.destinationStationId
+            ) ?? new Set<string>();
+            if (admittedTrains.has(trainId)) continue;
             trainKeys.add(key);
+            admittedTrains.add(trainId);
+            admittedTrainsByDestination.set(
+                path.destinationStationId,
+                admittedTrains
+            );
+            directCountByDestination.set(
+                path.destinationStationId,
+                (directCountByDestination.get(path.destinationStationId) ?? 0)
+                    + 1
+            );
             directPaths.push(path);
+        }
+        // Pass 1 guarantees every distinct (destination, train) pair a
+        // representative, but always picks whichever origin's version of
+        // that pair sorts first in the shared arrival/duration order - for
+        // the same scheduled arrival, that is always the origin with the
+        // SHORTEST in-vehicle time, i.e. the one boarding CLOSEST to the
+        // destination. A farther-but-still-legitimate origin can then go
+        // completely unrepresented even when every candidate boarding
+        // station is supposed to be searched independently (this is the
+        // same class of bug the origin-aware directServiceKey() fixed for
+        // dedup collisions - this is the admission-budget counterpart of
+        // it). Give every origin with at least one still-admissible direct
+        // candidate one guaranteed slot too, before Pass 2's unrestricted
+        // fill - still bounded by the same per-destination cap and train
+        // dedup as every other pass, so this can only add origin coverage,
+        // never displace Pass 1's picks or exceed destination fairness.
+        const admittedOrigins = new Set(
+            directPaths.map(path => path.originStationId)
+        );
+        for (const path of direct) {
             if (directPaths.length >= limits.maxResults) break;
+            if (admittedOrigins.has(path.originStationId)) continue;
+            const key = directServiceKey(path);
+            if (trainKeys.has(key)) continue;
+            const destinationCount = directCountByDestination.get(
+                path.destinationStationId
+            ) ?? 0;
+            if (destinationCount >= maxDirectResultsPerDestination) continue;
+            trainKeys.add(key);
+            admittedOrigins.add(path.originStationId);
+            directCountByDestination.set(
+                path.destinationStationId,
+                destinationCount + 1
+            );
+            directPaths.push(path);
+        }
+        for (const path of direct) {
+            if (directPaths.length >= limits.maxResults) break;
+            const key = directServiceKey(path);
+            if (trainKeys.has(key)) continue;
+            const destinationCount = directCountByDestination.get(
+                path.destinationStationId
+            ) ?? 0;
+            if (destinationCount >= maxDirectResultsPerDestination) continue;
+            trainKeys.add(key);
+            directCountByDestination.set(
+                path.destinationStationId,
+                destinationCount + 1
+            );
+            directPaths.push(path);
         }
         if (directPaths.length >= limits.maxResults) {
             return {

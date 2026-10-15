@@ -102,6 +102,7 @@ export async function searchAddressSuggestions(
         },
         body: JSON.stringify({
             input: input.input,
+            includedRegionCodes: ["in"],
             ...(input.sessionToken ? { sessionToken: input.sessionToken } : {})
         })
     });

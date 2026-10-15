@@ -192,6 +192,22 @@ const FIRST_HOP_MAX_FLIGHTS_TOTAL = 150;
 const ONWARD_HOP_MAX_FLIGHTS_PER_DESTINATION = 1;
 const ONWARD_HOP_MAX_FLIGHTS_TOTAL = 20;
 
+// remainingTimeHeuristicMs() below only estimates straight-line time to the
+// FINAL destination, which gives a feeder rail leg (one taken before any
+// flight - see MAX_FEEDER_RAIL_LEGS_BEFORE_FLIGHT above) no credit at all
+// for reaching a hub with a transfer link to flight connectivity, which is
+// the only reason that leg exists. Without this, the priority queue has no
+// way to distinguish a feeder stop that can actually reach a flight from
+// one that is a dead end for that purpose, so it explores both equally and
+// can exhaust the shared expansion budget on dead-end feeder stops before
+// ever reaching a productive one. This bonus only reorders which
+// same-tier, not-yet-flown state is explored first (it cannot change which
+// states are admitted, nor override scheduledLegs as the primary sort key
+// for "transfers" - the default and most heavily used sort), so it cannot
+// cause a worse itinerary to be returned in place of a better one that was
+// already found; it can only help the search reach a productive one sooner.
+const FEEDER_TRANSFER_CONNECTIVITY_BONUS_MS = 3 * 60 * 60 * 1000;
+
 function toRadians(degrees: number): number {
     return degrees * Math.PI / 180;
 }
@@ -652,10 +668,33 @@ function practicalityScore(result: MultimodalJourneyResult): number {
         + transferDetourPenaltyMinutes(result);
 }
 
+function totalRoadAccessMinutes(result: MultimodalJourneyResult): number {
+    return result.legs
+        .filter(leg => leg.mode === "LOCAL")
+        .reduce((total, leg) => total + (Number(leg.durationMinutes) || 0), 0);
+}
+
 export function compareMultimodalJourneyResults(
     left: MultimodalJourneyResult,
     right: MultimodalJourneyResult
 ): number {
+    // For two rail-only itineraries, totalJourneyMinutes (part of
+    // practicalityScore) is computed backward from each candidate's own
+    // boarding/alighting stop, so boarding/alighting the same train at a
+    // stop reached by road can look "faster" than a candidate that needs no
+    // local transport at all - purely because part of the trip moved from
+    // rail to road, not because it is actually simpler. AGENTS.md's
+    // Practicality section lists "long road access" as its own penalty
+    // dimension; comparing it directly here (ahead of practicalityScore)
+    // ensures a candidate needing no local transport is never outranked by
+    // one that does, on duration alone. Scoped to rail-only vs rail-only so
+    // it never distorts a flight-vs-rail comparison, where the (often large)
+    // duration difference remains the dominant, correct signal.
+    if (left.journeyType === "RAIL_ONLY" && right.journeyType === "RAIL_ONLY") {
+        const railTieBreak = left.numberOfTransfers - right.numberOfTransfers
+            || totalRoadAccessMinutes(left) - totalRoadAccessMinutes(right);
+        if (railTieBreak !== 0) return railTieBreak;
+    }
     return practicalityScore(left) - practicalityScore(right)
         || left.numberOfTransfers - right.numberOfTransfers
         || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt);
@@ -671,12 +710,14 @@ function compareMultimodalResultsBy(
             || compareMultimodalJourneyResults(left, right);
     }
     if (sortBy === "departure") {
-        const scheduledDeparture = (result: MultimodalJourneyResult) =>
-            result.legs.find(leg =>
-                leg.mode === "RAIL" || leg.mode === "FLIGHT"
-            )?.departureAt ?? result.departureAt;
-        return Date.parse(scheduledDeparture(left))
-            - Date.parse(scheduledDeparture(right))
+        // result.departureAt is already each journey's actual start (leave
+        // -home time when road access/boarding wait applies, otherwise the
+        // first RAIL/FLIGHT leg's own departure) - see convertRailwayResult
+        // and the RAIL/FLIGHT leg builders. Sorting on it directly keeps
+        // this comparator consistent with the railway engine's own
+        // departure-sort key (compareJourneyOptions), which uses the same
+        // actual-start value rather than a raw scheduled leg time.
+        return Date.parse(left.departureAt) - Date.parse(right.departureAt)
             || compareMultimodalJourneyResults(left, right);
     }
     if (sortBy === "arrival") {
@@ -846,6 +887,24 @@ async function executeSearch(
         transfersByHub.set(key, values);
     }
     const destinationByHub = new Map(destinationHubs.map(hub => [hub.id, hub]));
+    // Any flight obtainable from one of these airports is already explored
+    // directly from the origin's own seed state (scheduledLegs 0). Reaching
+    // the SAME airport again via a feeder rail leg plus a road transfer
+    // (scheduledLegs 1) can never surface a flight that direct access to it
+    // didn't already offer, and always takes at least as long - it is a
+    // pure duplicate of an already-explored branch, not a genuinely
+    // different alternative. Skipping it only prunes this provably
+    // redundant re-discovery, freeing search budget for feeder-rail
+    // destinations that reach a DIFFERENT airport the origin cannot access
+    // directly - the actual value of "rail to a hub with flight
+    // connectivity" described where MAX_FEEDER_RAIL_LEGS_BEFORE_FLIGHT is
+    // defined above.
+    const originAirportHubIds = new Set(
+        sourceHubs
+            .map(candidate => hubs.get(candidate.id))
+            .filter((hub): hub is RoutingHub => hub?.type === "AIRPORT")
+            .map(hub => hub.id)
+    );
     const queue = new StateQueue(request.options.sortBy);
     const best = new Map<string, number>();
     const origin = endpointPlace(request, "USER_LOCATION");
@@ -988,6 +1047,8 @@ async function executeSearch(
                     && departureMs >= firstServiceDateEndMs) continue;
                 const first = ride.connections[0];
                 const last = ride.connections[ride.connections.length - 1];
+                const isUsefulFeederStop = !state.modes.includes("FLIGHT")
+                    && (transfersByHub.get(target.id)?.length ?? 0) > 0;
                 registerState({
                     ...state,
                     hubId: target.id,
@@ -995,7 +1056,7 @@ async function executeSearch(
                     priority: arrivalMs + remainingTimeHeuristicMs(
                         target.latitude, target.longitude,
                         request.destination.latitude, request.destination.longitude
-                    ),
+                    ) - (isUsefulFeederStop ? FEEDER_TRANSFER_CONNECTIVITY_BONUS_MS : 0),
                     scheduledLegs: state.scheduledLegs + 1,
                     lastMode: "RAIL",
                     currentCityId: target.cityId,
@@ -1101,6 +1162,11 @@ async function executeSearch(
             for (const transfer of transfersByHub.get(hub.id) ?? []) {
                 const target = hubs.get(transfer.toHubId.toString());
                 if (!target || chainHas(state.visitedHubIds, target.id)) continue;
+                if (
+                    state.lastMode === "RAIL"
+                    && target.type === "AIRPORT"
+                    && originAirportHubIds.has(target.id)
+                ) continue;
                 let extraMinutes = 0;
                 let transferType = "INTERMODAL_TRANSFER";
                 if (state.lastMode === "RAIL" && target.type === "AIRPORT") {

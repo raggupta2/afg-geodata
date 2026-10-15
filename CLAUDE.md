@@ -2,12 +2,21 @@
 
 Before investigating or changing this repository, read these files in order:
 
-1. `AGENTS.md` — authoritative engineering, routing, execution, and reporting
+1. `CHANGELOG.md` — current status, next steps, and the dated session log.
+   Do not assume the previous session's state from memory; a different agent
+   (Claude or Codex) or account may have made the last change.
+2. `AGENTS.md` — authoritative engineering, routing, execution, and reporting
    rules.
-2. `PROJECT_MEMORY.md` — concise durable requirements, established root causes,
+3. `PROJECT_MEMORY.md` — concise durable requirements, established root causes,
    implementation state, and verification status.
-3. `CONVERSATION_MEMORY.md` — normalized chronology of the user-visible requests
+4. `CONVERSATION_MEMORY.md` — normalized chronology of the user-visible requests
    that produced the current working tree.
+
+Before ending a session — whether a phase finished or the session is stopping
+for any other reason (e.g. a token/usage limit) — append a dated entry to
+`CHANGELOG.md` summarizing what changed and what's next, and update its
+"Current status" section. This applies even if the current phase is not
+complete.
 
 Treat the current repository and database as authoritative. Preserve all
 existing uncommitted changes unless the user explicitly asks to discard them.

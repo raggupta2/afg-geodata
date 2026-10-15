@@ -262,12 +262,25 @@ test("coordinate search returns ranked nearby-station journeys", async () => {
         new Set(body.data.trainResults.map(option => option.itineraryKey)).size,
         body.data.trainResults.length
     );
+    const roadAccessMinutes = option => option.legs
+        .filter(leg => leg.mode === "LOCAL")
+        .reduce((total, leg) => total + leg.durationMinutes, 0);
     for (let index = 1; index < body.data.trainResults.length; index += 1) {
         const previous = body.data.trainResults[index - 1];
         const current = body.data.trainResults[index];
         assert.ok(previous.numberOfTransfers <= current.numberOfTransfers);
         if (previous.numberOfTransfers === current.numberOfTransfers) {
-            assert.ok(previous.totalJourneyMinutes <= current.totalJourneyMinutes);
+            const previousRoadAccess = roadAccessMinutes(previous);
+            const currentRoadAccess = roadAccessMinutes(current);
+            // Requiring less total local/road access (e.g. boarding a train
+            // from the station actually searched, instead of a road detour
+            // to a different stop on the same train) must rank ahead of a
+            // candidate that only shows a lower totalJourneyMinutes because
+            // part of the trip moved from rail to road.
+            assert.ok(previousRoadAccess <= currentRoadAccess);
+            if (previousRoadAccess === currentRoadAccess) {
+                assert.ok(previous.totalJourneyMinutes <= current.totalJourneyMinutes);
+            }
         }
     }
     assert.ok(body.data.trainResults.every(
@@ -305,11 +318,24 @@ test("date-only search includes the direct HW to LMNR train", async () => {
     assert.equal(body.data.request.searchMode, "DATE_ONLY");
     assert.equal(body.data.request.departureAt, null);
 
+    // Each boarding station of train 14310 groups into its own trainResults
+    // entry (itineraryKey is boarding-and-alighting-specific, so a farther
+    // boarding station is never silently folded into a closer station's
+    // "recommended" pick and lost - see PROJECT_MEMORY.md's "Direct-boarding
+    // train hidden entirely" root cause). Locate the entry that boards at,
+    // or cross-references, HW rather than assuming a single grouped result.
     const direct = body.data.trainResults.find(option =>
-        option.itineraryKey === "DIRECT|14310@2026-08-04"
+        option.trainNumber === "14310"
+        && option.journeyType === "DIRECT"
+        && (option.recommendedBoardingStation.code === "HW"
+            || option.alternativeBoardingStations.some(
+                alternative => alternative.station.code === "HW"
+            ))
     );
-    assert.ok(direct, "Expected one grouped 14310 direct-train result.");
-    assert.equal(direct.journeyType, "DIRECT");
+    assert.ok(
+        direct,
+        "Expected a grouped 14310 direct-train result boarding at, or referencing, HW."
+    );
     assert.equal(direct.numberOfTransfers, 0);
     assert.ok(
         direct.availableDestinationStations.some(
