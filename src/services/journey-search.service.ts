@@ -426,6 +426,12 @@ function railLegs(option: JourneySearchOption): RailJourneyLeg[] {
 // part of the trip moved from rail to road. Comparing total road-access
 // minutes before raw duration ensures a candidate that needs no local
 // transport is never outranked, by duration alone, by one that does.
+// Both keys come after earliest final arrival (AGENTS.md ranking rule 1):
+// neither reflects how long the traveler waits for the first train, so
+// ranking on them first let a short trip days later (e.g. a weekly train)
+// outrank an equally direct train arriving days earlier. Boarding
+// variants of the same train run share their final arrival, so road
+// access still decides between them.
 function totalRoadAccessMinutes(option: JourneySearchOption): number {
     return option.sourceAccess.travelMinutes + option.destinationAccess.travelMinutes;
 }
@@ -436,10 +442,10 @@ function compareJourneyOptions(
     sortBy: JourneySortOrder = "transfers"
 ): number {
     const tieBreak = left.numberOfTransfers - right.numberOfTransfers
+        || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt)
         || totalRoadAccessMinutes(left) - totalRoadAccessMinutes(right)
         || left.totalJourneyMinutes - right.totalJourneyMinutes
         || left.preTrainWaitingMinutes - right.preTrainWaitingMinutes
-        || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt)
         || left.railTransferWaitingMinutes
             - right.railTransferWaitingMinutes;
     if (sortBy === "duration") {
@@ -990,7 +996,12 @@ async function executeCoordinateRailwayJourneySearch(
         request.options.resultLimit,
         routingLimits,
         dateOnlySearch ? 24 * 60 : undefined,
-        request.options.sortBy
+        request.options.sortBy,
+        new Map(destinationStations.map(station => [
+            station.id,
+            calculateStationAccess(station.aerialDistanceKm, policy)
+                .travelMinutes
+        ]))
     );
 
     const allOptions = providerResult.paths

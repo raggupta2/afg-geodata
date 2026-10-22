@@ -269,7 +269,13 @@ test("coordinate search returns ranked nearby-station journeys", async () => {
         const previous = body.data.trainResults[index - 1];
         const current = body.data.trainResults[index];
         assert.ok(previous.numberOfTransfers <= current.numberOfTransfers);
-        if (previous.numberOfTransfers === current.numberOfTransfers) {
+        if (previous.numberOfTransfers !== current.numberOfTransfers) continue;
+        const previousArrival = Date.parse(previous.finalArrivalAt);
+        const currentArrival = Date.parse(current.finalArrivalAt);
+        // Earliest final arrival comes first, so a shorter trip on a later
+        // day can never outrank an equally direct train arriving sooner.
+        assert.ok(previousArrival <= currentArrival);
+        if (previousArrival === currentArrival) {
             const previousRoadAccess = roadAccessMinutes(previous);
             const currentRoadAccess = roadAccessMinutes(current);
             // Requiring less total local/road access (e.g. boarding a train

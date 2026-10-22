@@ -690,8 +690,14 @@ export function compareMultimodalJourneyResults(
     // one that does, on duration alone. Scoped to rail-only vs rail-only so
     // it never distorts a flight-vs-rail comparison, where the (often large)
     // duration difference remains the dominant, correct signal.
+    // Earliest final arrival is checked before road access: totalJourneyMinutes
+    // excludes the wait for the first train, so without it a short trip days
+    // later (e.g. a weekly train) outranked an equally direct train arriving
+    // days earlier. Boarding variants of the same train run share their
+    // final arrival, so road access still decides between them.
     if (left.journeyType === "RAIL_ONLY" && right.journeyType === "RAIL_ONLY") {
         const railTieBreak = left.numberOfTransfers - right.numberOfTransfers
+            || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt)
             || totalRoadAccessMinutes(left) - totalRoadAccessMinutes(right);
         if (railTieBreak !== 0) return railTieBreak;
     }

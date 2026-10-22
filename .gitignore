@@ -13,3 +13,4 @@ scripts/
 scripts/*
 !scripts/import_train_timetables.py
 
+data/

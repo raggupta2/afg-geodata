@@ -22,8 +22,35 @@ not any agent's private memory — is the source of truth for "where are we".
 
 ---
 
-## Current status (updated 2026-10-15)
+## Current status (updated 2026-10-21)
 
+- **Update 2026-10-21 (later):** RAIL_ONLY ranking fix — under the default
+  `sortBy=transfers`, equal-transfer trains are now ordered by earliest final
+  arrival before road access / duration (`journey-search.service.ts`
+  `compareJourneyOptions`, `multimodal-journey.service.ts`
+  `compareMultimodalJourneyResults`). Fixes Haridwar → Kota (2026-11-05
+  15:15) showing the Sunday-only 09102 on 8 Nov as option 2. Uncommitted;
+  running servers need rebuild + restart. Follow-up done the same day: the
+  direct pass now keeps the boarding needing least road access (12402/19020
+  shown from Haridwar, not Roorkee/Jwalapur). See the two log entries.
+- **Update 2026-10-21:** second export
+  `flights-2026-10-21T07-21-26-867Z.sqlite` imported into the local DB:
+  2,436 active FLIGHT_SQLITE flights now (71 origins → 99 destinations on
+  2026-11-16; DED also on 2026-11-03..07, 11-15, 2027-01-31). Airlines S5 and
+  QP added. No code changed. See the 2026-10-21 log entry.
+- **Update 2026-10-17:** flight data now comes from the project's own flight
+  SQLite exports instead of Aviation Edge. New migration
+  `20261017120000_flight_sqlite_source` (plus the previously pending
+  `20260902090000_journey_search_candidate_indexes`) is applied to the local
+  DB; importer `npm run data:import-flights -- --file <export.sqlite>`
+  (`src/maintenance/import-flight-sqlite.ts`); the Aviation Edge importer and
+  `data:import-aviation` were removed. First export imported (35 DED
+  flights, now 29 ACCEPTED-only). **All Aviation Edge flight data has been
+  deleted** (migration `20261017150000_remove_aviation_edge_data`); flight
+  search now only has the SQLite export's flights (DED, 2026-11-15 and
+  2027-01-31). Uncommitted. See the 2026-10-17 log entry.
+- **Update 2026-10-16:** explained a read-only SQLite query against
+  `valid_flights`; no source code changed and no commands were run.
 - **Update 2026-10-15:** line endings normalized (`.gitattributes`
   `* text=auto eol=lf`, working files converted to LF, exec bits reverted)
   and the verified work below was committed. The next two bullets describe the
@@ -55,8 +82,10 @@ not any agent's private memory — is the source of truth for "where are we".
   only RAIL_ONLY results. This is the documented `RAIL_TO_FLIGHT` /
   mixed-journey truncation issue under default `sortBy=transfers`; needs a
   dedicated session and explicit user authorization.
-- **Pending DB migration:** `20260902090000_journey_search_candidate_indexes`
-  is NOT applied to the local `afg_geodata` database (`prisma migrate status`).
+- **Pending DB migration:** none locally as of 2026-10-17 (both
+  `20260902090000_journey_search_candidate_indexes` and
+  `20261017120000_flight_sqlite_source` applied). Other environments still
+  need `npx prisma migrate deploy` + `npm run data:import-flights`.
 - **Missing file:** `docs/production-environment-variables.md` is referenced
   by the memory files but `docs/` is git-ignored, so it was not carried over to
   this account.
@@ -66,8 +95,7 @@ not any agent's private memory — is the source of truth for "where are we".
 1. User decision: normalize line endings / file mode (e.g. add
    `.gitattributes` with `* text=auto eol=lf` and/or
    `git config core.fileMode false`) and commit the current verified work.
-2. Apply the pending index migration (`npx prisma migrate deploy`/`dev`) when
-   the user approves.
+2. ~~Apply the pending index migration~~ — done locally 2026-10-17.
 3. Fix the deferred `RAIL_TO_FLIGHT` truncation under `sortBy=transfers`
    (see PROJECT_MEMORY "`journeyTypes` filter validation…").
 4. Investigate 30–65 s latency for `sortBy=departure|arrival|duration` on
@@ -174,3 +202,235 @@ and `CONVERSATION_MEMORY.md` for details.
   correctness/frontend work plus memory docs and this changelog. `.DS_Store`
   files left untracked.
 - **Next:** items 2–7 in "Next steps" (migration, RAIL_TO_FLIGHT, latency, ...).
+
+### 2026-10-16 — Explain a SQLite query
+
+- **Why:** user requested an explanation of `SELECT * FROM valid_flights
+  WHERE origin_code = 'DED'`.
+- **Done:** explained the query's selection and filtering behavior; no source
+  code changed and no commands were run.
+- **Next:** unchanged from "Next steps" above.
+
+### 2026-10-17 — Review scraped flight SQLite for import (Claude Code, Opus 5.5)
+
+- **Why:** user asked whether `flights-2026-10-17T07-19-09-882Z.sqlite`
+  (Cleartrip/MakeMyTrip scrape) is well-formed and usable by the route finder.
+- **Done (analysis only):** read-only `sqlite3 -readonly` queries on the
+  user's file; no source code, Prisma schema, or project DB touched.
+- **Findings:** file integrity OK; 205 itineraries, all from DED, 10
+  destinations, 2 dates (2026-11-15, 2027-01-31), MakeMyTrip only (Cleartrip
+  session FAILED, so `confirmed_flights` is empty). Only 29 ACCEPTED + 6
+  NEEDS_REVIEW (nearby-airport DXN/NMI) nonstop rows are importable; the 170
+  connecting itineraries lack per-leg times. Nonstop times/UTC/duration are
+  internally consistent. Data is dated instances, not a recurring schedule;
+  no terminals/aircraft. Import would need mapping to
+  `aviation_flight_instances` + `aviation_airlines` (`service_type =
+  'scheduled'`) + existing `aviation_airports`/hubs (DXN/NMI presence in
+  Postgres not verified).
+- **Next:** user decision on scope/source before writing an importer.
+- **Decision (user, same day):** flight data source will move from the
+  Aviation Edge API to the scraped SQLite export. User instruction: do not
+  change code or DB structure until explicitly asked. Impact analysis given
+  in chat (airport/airline provider-ID constraints, coverage, replace-vs-merge
+  of existing Aviation Edge rows); nothing implemented.
+- **Read-only DB check (user-authorized, same day):** psql session forced
+  `default_transaction_read_only=on`; SELECTs only, no writes. Aviation Edge
+  data: 158,934 active flight instances, service dates 2026-08-31 →
+  2026-12-29 (December thin: 6,462), imported 2026-08-03..07, 140 airports,
+  56 airlines (150,082 instances searchable via `service_type='scheduled'`).
+  6E/AI/IX exist and are `scheduled`. DED and the 9 other searched airports
+  exist with active hubs; **DXN and NMI are missing** from
+  `aviation_airports`/AIRPORT hubs (hub code DXN is only a railway station,
+  allowed by unique `(hub_type, code)`). Aviation Edge has only 1–4 DED
+  departures/day vs ~16 nonstops in the SQLite sample, with zero overlap on
+  2026-11-15 and different times for shared flight numbers (e.g. 6E402
+  13:40 vs 09:10) — Aviation Edge future data looks stale/incomplete.
+  2027-01-31 is beyond Aviation Edge coverage.
+- **Import design requested (same day, no code yet):** user asked for a
+  fresh SQLite flight importer (airports seeded by migration, initial import
+  + recurring update scripts, schema change keeping existing behaviour, fare
+  table for future pricing). Read-only findings: SQLite has all 140 DB
+  airports + 25 new (incl. DXN, NMI, GOX, HSR, HDO); 36 shared airports'
+  coordinates differ >3 km from DB hubs (PAB 1159 km, BEK 301 km, DED
+  19.7 km); 10 airport hubs have no `city_id`. Node v26 → built-in
+  `node:sqlite` usable (no new dependency). Plan given in chat; awaiting user
+  decisions (AE deactivation scope, coordinate source) before implementing.
+
+### 2026-10-17 — Switch flight data from Aviation Edge to SQLite exports (Claude Code, Opus 5.5)
+
+- **Why:** user asked to stop using Aviation Edge and use the project's own
+  flight SQLite export as the flight source, with a new migration, a reliable
+  import, and no regressions. User chose: deactivate Aviation Edge flights only
+  on routes/dates the export re-collected; remove the Aviation Edge importer.
+- **Finding:** the app never called the Aviation Edge API at runtime; it only
+  read flights from `aviation_flight_instances`, filled by the offline
+  `import-aviation-edge.ts` file importer. Search code needed no change.
+- **Changed:**
+  - `prisma/migrations/20261017120000_flight_sqlite_source/migration.sql`:
+    `provider_airport_id`/`provider_airline_id` nullable; `data_source` on
+    airports, airlines, flight instances, schedule imports (existing rows
+    `AVIATION_EDGE`, new default `FLIGHT_SQLITE`); `source_provider`,
+    `source_record_id`, `last_seen_at` on flight instances; route/date index;
+    new `aviation_flight_fares` (stored for future pricing, not read by
+    search); seeds the 165 export airports — only the 25 missing ones are
+    inserted (existing airports keep hub/coords/city).
+  - `prisma/schema.prisma`: matching fields + `AviationFlightFare` model.
+  - `src/maintenance/import-flight-sqlite.ts` (new): validates the export
+    schema; imports ACCEPTED direct flights only (user decision, see
+    follow-up below); same identity key as
+    existing rows (update, not duplicate); deactivates (never deletes) flights
+    missing from a route/date with a COMPLETED search; stores fares; updates
+    schedule-import and coverage records; skips an already-imported checksum
+    (`--force` to redo, `--dry-run` to preview); links export airport hubs to
+    the nearest city and transfer links (`--refresh-all-transfer-links` for
+    the old full rebuild). Runs in one transaction.
+  - `src/maintenance/transport-hub-links.ts` (new): full transfer-link refresh
+    moved unchanged from the old importer + a hub-scoped variant.
+  - Removed `src/maintenance/import-aviation-edge.ts`; `package.json`
+    `data:import-aviation` → `data:import-flights`; test skip message wording.
+- **Local DB run:** backup `pg_dump` of aviation/hub tables taken first
+  (session scratchpad, not in repo). Import: 35 flights created, 4 Aviation
+  Edge DED flights on 2026-11-15 deactivated (IX2017, 6E6344, 6E6455,
+  6E7714), 39 fares, 629 new transfer links for new airports; the 9,434
+  pre-existing links untouched. Re-run skips; `--force` re-run updates 35,
+  creates 0, adds 0 fares.
+- **Verification:** `npx tsc --noEmit` clean; railway-search 13/13;
+  multimodal-search 22/23 (same pre-existing DDN→DEL 2026-09-18 failure as
+  baseline before the change). Real `searchMultimodalJourneys` DED→DEL:
+  2026-11-15 FLIGHT_ONLY returns 6E6530 08:55 and DXN flights from the
+  export; 2027-01-31 returns AI438 (date beyond Aviation Edge data).
+- **Known limits / next:** export covers only DED on 2 dates — all other
+  routes still use the (stale) Aviation Edge rows until exports cover them.
+  16 of the 25 new airports (incl. DXN) have no city within 60 km, so no
+  station↔airport transfer links. Nothing committed. Production needs
+  `prisma migrate deploy` then `npm run data:import-flights -- --file …`.
+- **Follow-up (same day, user request):** importer limited to
+  `validation_status = 'ACCEPTED'` (NEEDS_REVIEW nearby-airport DXN/NMI rows
+  no longer imported). Local DB: `--force` re-import updated 29 and
+  deactivated the 2 NMI rows (covered route); the 4 DXN rows (route not
+  covered: its search was NO_RESULTS) were deactivated manually by id. Now 29
+  active FLIGHT_SQLITE flights, 6 inactive (kept, not deleted). Seeded
+  DXN/NMI airports remain. Re-verified: tsc clean, railway 13/13, multimodal
+  22/23 (same known failure); DED→DEL search no longer shows DXN flights.
+- **Follow-up 2 (same day, user request: remove Aviation Edge data):** user
+  chose delete (not deactivate) for flights/bookkeeping, and keep airports +
+  airlines with Aviation Edge IDs cleared. New migration
+  `20261017150000_remove_aviation_edge_data`: deletes `AVIATION_EDGE` flight
+  instances (158,934) and schedule imports (12,191), deletes coverage rows not
+  backed by a FLIGHT_SQLITE import (12,186), sets `provider_airport_id` /
+  `provider_airline_id` NULL and `data_source = 'FLIGHT_SQLITE'` on all 165
+  airports and 56 airlines. Backup `pg_dump` taken first (session scratchpad).
+  Importer link step now targets only airport hubs with no transfer links
+  (all airports are FLIGHT_SQLITE now, so tagging no longer identifies new
+  ones). That run created 179 new links for HDX and DBR, existing airports
+  that had a city but had never been linked; no existing link was modified.
+  Re-verified: tsc clean; railway 13/13; multimodal 21 pass / 0 fail / 2 skip
+  (the DDN→DEL 2026-09-18 test and the `loadFlightInstances` window test skip
+  because their hard-coded September dates have no flights now; the
+  `RAIL_TO_FLIGHT`/mixed truncation bug is NOT fixed). Search DED→DEL returns
+  6E6530 (2026-11-15) and AI438 (2027-01-31). Data notes: HDX (Aviation Edge)
+  and HDO (SQLite) are both Hindon airport.
+- **Next:** decide whether to retarget the two skipped multimodal tests to
+  dates covered by SQLite exports; collect exports for more origins/dates.
+
+### 2026-10-21 — Import second flight SQLite export (Claude Code, Opus 5.5)
+
+- **Why:** user asked to import
+  `~/Downloads/flights-2026-10-21T07-21-26-867Z.sqlite`.
+- **Export:** integrity OK; Cleartrip, MakeMyTrip and Yatra sessions;
+  2,722 ACCEPTED direct rows, 157 NEEDS_REVIEW and 6,673
+  REJECTED_NOT_DIRECT (not imported). 71 origins on 2026-11-16, plus DED on
+  2026-11-03..07, 2026-11-15 and 2027-01-31.
+- **Run (local DB, no code changed):** backup `pg_dump` of aviation/hub
+  tables taken first (session scratchpad, not in repo). Dry run then
+  `node dist/maintenance/import-flight-sqlite.js --file …`: 2,436 unique
+  flights (286 duplicate rows were the same flight from several providers),
+  2,407 created, 29 updated (the earlier DED flights), 0 deactivated,
+  3,174 fares, 731 covered route/dates, no unknown airports or invalid rows,
+  airlines S5 (Star Air) and QP (Akasa Air) added as `scheduled`, 0 new
+  transfer links. Active flights 29 → 2,436.
+- **Verification:** `npm run build` clean (via `data:import-flights`);
+  multimodal-search 21 pass / 0 fail / 2 skip (same skips as 2026-10-17);
+  no active flight has arrival ≤ departure; BOM→DEL 2026-11-16 returns
+  AI2956, 6E6045, 6E656, … in time order.
+- **Note:** `pg_dump` must use the URL from `.env` parsed by Node; extracting
+  it with shell `sed` produced a wrong connection string.
+- **Next:** unchanged from 2026-10-17 (the two skipped multimodal tests still
+  target September dates with no flights; collect exports for more dates).
+
+### 2026-10-21 — RAIL_ONLY ranking: earliest arrival before road access (Claude Code, Opus 5.5)
+
+- **Why:** user reported Haridwar, Uttarakhand → Kota, Rajasthan,
+  2026-11-05 15:15 (default `sortBy=transfers`): option 1 (22918, 5 Nov
+  16:57) correct, but option 2 was 09102 departing Sun 8 Nov 16:22.
+- **Reproduced** (user-authorized: build, read-only DB queries, temporary
+  script calling `searchMultimodalJourneys`, deleted after use): all 10
+  results are 0-transfer. 09102 runs Sundays only (`runs_mask` 64) and
+  22918 Thursdays only (8), so the dates are right; the order was wrong.
+  Equal-transfer tie-break was road access → duration/practicality →
+  arrival, so 09102 (27 min road, 706 min) outranked 19020 (daily, arrives
+  7 Nov) and 12402 (daily, arrives 6 Nov 10:41).
+- **Root cause:** `compareJourneyOptions` (`journey-search.service.ts`) and
+  the RAIL_ONLY branch of `compareMultimodalJourneyResults`
+  (`multimodal-journey.service.ts`) ranked road access and duration ahead of
+  final arrival. Neither counts the wait for the first train, so a shorter
+  trip days later beat an equally direct, earlier-arriving train.
+- **Changed:** both comparators now use transfers → earliest final arrival →
+  road access → duration (rest unchanged). Comments updated.
+  `tests/railway-search.test.js` ranking assertion now checks arrival before
+  road access; new unit test in `tests/multimodal-search.test.js` for the
+  HW→KOTA case.
+- **Result:** HW→KOTA order is 22918 HW, 22918 RK, 12402 RK (6 Nov),
+  19020 (7 Nov) ×5, then 09102 ×2 (9 Nov) last. DWX→SVDK 2026-09-10 (the
+  earlier road-access fix case) still ranks the direct Dewas 12919 first;
+  only the two 09321 entries swapped (MKC→JAT arrives earlier).
+- **Verification:** `npx tsc --noEmit` clean; `npm run build` clean;
+  railway-search 13/13; multimodal-search 22 pass / 0 fail / 2 skip (same
+  two September-date skips as before).
+- **Found, not fixed (needs user OK):** the transfers-sort direct pass in
+  `executeSearch` (`railway-provider.service.ts`) picks one origin per
+  (destination, train), choosing the shortest in-vehicle time, i.e. the
+  farthest-downstream boarding. So 12402 (HW 00:14) and 19020 (HW 13:30) to
+  KOTA appear only from Roorkee/Jwalapur, not Haridwar itself.
+- **Next:** decide on the boarding-retention fix above; restart servers to
+  pick up the build.
+
+### 2026-10-21 — Direct pass keeps the traveler's own boarding station (Claude Code, Opus 5.5)
+
+- **Why:** user approved fixing the follow-up above: trains that stop at
+  Haridwar must be shown boarding at Haridwar.
+- **Root cause:** in `executeSearch` (`railway-provider.service.ts`), the
+  transfers-sort direct pass sorted by transfers → train arrival → in-vehicle
+  duration. Boardings of one train run share the arrival, so duration
+  always picked the stop farthest down the line (Roorkee/Jwalapur) as
+  Pass 1's single (destination, train) representative.
+- **Changed:**
+  - Direct-pass sort is now transfers → door-to-door arrival (train arrival
+    + destination road access) → total road access → existing keys.
+  - `searchRailwayProvider` takes an optional `destinationRoadAccessMinutes`
+    map (only caller `journey-search.service.ts` passes
+    `calculateStationAccess(...).travelMinutes` per destination station).
+    The provider cache key now includes origin and destination road-access
+    minutes.
+  - `findDirectPaths` drops an origin's early-stop alighting of a train when
+    the same train reaches a later candidate stop with no more road access
+    (same rule as `pruneUpstreamAlightingDetours`), before the quotas. Needed
+    because the first change alone regressed "date-only search includes the
+    direct HW to LMNR train": Haridwar's one origin slot went to Dewas,
+    which the prune later removed, so HW→LMNR never surfaced.
+  - New DB-backed test in `tests/multimodal-search.test.js` (HW→KOTA
+    2026-11-05 15:15: 12402 and 19020 board at HW; direct results ordered by
+    arrival).
+- **Result:** HW→KOTA: 22918 HW, 22918 RK, 12402 **HW** (6 Nov), 19020
+  **HW**→KOTA, 19020 JWP→KOTA, 19020 →NKOT ×3, 09102 **HW**→KOTA (9 Nov),
+  09102 RK→NKOT, then two 1-transfer options. LMNR test search: YNRK→LMNR and
+  HW→LMNR are back. DWX→SVDK: Dewas 12919 still #1; 09321 now alights at
+  SVDK (MKC→SVDK) instead of Jammu Tawi.
+- **Verification:** `npx tsc --noEmit` clean; build clean; railway-search
+  13/13; multimodal-search 23 pass / 0 fail / 2 skip (same skips).
+  Temporary repro scripts deleted.
+- **Known, not changed:** `searchEarliestPaths` (fills slots left after the
+  direct pass) has no such alighting check, so an early-stop variant can
+  still appear from there (e.g. RK→DWX in the LMNR search). Pre-existing,
+  already flagged in PROJECT_MEMORY.
+- **Next:** commit when the user asks; restart running servers.

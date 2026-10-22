@@ -188,6 +188,37 @@ test("multimodal server sorting defaults to transfers and honors overrides", () 
     );
 });
 
+test("rail-only ranking prefers an earlier-arriving direct train over a shorter trip days later", () => {
+    const railOnly = (id, departureAt, finalArrivalAt, minutes, roadMinutes) => ({
+        id,
+        rank: 0,
+        journeyType: "RAIL_ONLY",
+        departureHub: {},
+        arrivalHub: {},
+        departureAt,
+        finalArrivalAt,
+        totalJourneyMinutes: minutes,
+        numberOfTransfers: 0,
+        scheduledLegs: 1,
+        modes: ["RAIL"],
+        legs: [{ mode: "LOCAL", durationMinutes: roadMinutes }]
+    });
+    // Haridwar -> Kota, 2026-11-05 15:15: daily 12402 arrives on 6 Nov,
+    // while the Sunday-only 09102 is shorter but arrives on 9 Nov.
+    const earlier = railOnly(
+        "earlier", "2026-11-05T23:49:00+05:30", "2026-11-06T10:41:00+05:30", 652, 51
+    );
+    const later = railOnly(
+        "later", "2026-11-08T16:22:00+05:30", "2026-11-09T04:08:00+05:30", 706, 27
+    );
+
+    assert.deepEqual(
+        selectMultimodalJourneyResults([later, earlier], undefined, 5)
+            .map(item => item.id),
+        ["earlier", "later"]
+    );
+});
+
 test("multimodal ranking prefers practicality over raw duration alone", () => {
     const base = {
         id: "base",
@@ -390,7 +421,7 @@ test("loadFlightInstances applies time, service, and per-airport limits in SQL",
 test("imported flight instances are domestic operating services", async t => {
     const count = await prisma.aviationFlightInstance.count();
     if (count === 0) {
-        t.skip("Aviation Edge schedules have not been imported in this database.");
+        t.skip("Flight schedules have not been imported in this database.");
         return;
     }
     const invalid = await prisma.aviationFlightInstance.count({
@@ -535,6 +566,47 @@ test("RAIL_ONLY returns departures after the requested time with server paginati
             leg.mode === "RAIL" && leg.serviceNumber === "14310"
         )
     ));
+});
+
+test("RAIL_ONLY Haridwar to Kota boards trains at Haridwar and ranks later weekly trains last", async () => {
+    const response = await fetch(`${baseUrl}/api/v1/journeys/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            origin: { latitude: 29.9456906, longitude: 78.1642478 },
+            destination: { latitude: 25.2138156, longitude: 75.8647527 },
+            departureAt: "2026-11-05T15:15:00+05:30",
+            options: {
+                journeyTypes: ["RAIL_ONLY"],
+                sortBy: "transfers",
+                resultOffset: 0,
+                pageSize: 20
+            }
+        })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+
+    const results = body.data.journeyResults;
+    const firstRail = journey => journey.legs.find(leg => leg.mode === "RAIL");
+    // 12402 and 19020 both stop at Haridwar; they must not be offered only
+    // from Roorkee/Jwalapur, which are farther down the line.
+    for (const trainNumber of ["12402", "19020"]) {
+        assert.ok(
+            results.some(journey =>
+                firstRail(journey)?.serviceNumber === trainNumber
+                && firstRail(journey).from.code === "HW"
+            ),
+            `Expected ${trainNumber} boarding at HW.`
+        );
+    }
+    const direct = results.filter(journey => journey.numberOfTransfers === 0);
+    for (let index = 1; index < direct.length; index += 1) {
+        assert.ok(
+            Date.parse(direct[index - 1].finalArrivalAt)
+                <= Date.parse(direct[index].finalArrivalAt)
+        );
+    }
 });
 
 test("station-airport links are directional and use positive road estimates", async t => {

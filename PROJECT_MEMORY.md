@@ -1226,6 +1226,29 @@ safely fixed:**
     duration-first tie-break as correct; updated to check total road-access
     minutes ascending before duration, matching the new, intended contract.
 
+### Weekly train days later ranked above an earlier-arriving direct train (2026-10-21)
+
+- Reported: Haridwar → Kota, RAIL_ONLY, `2026-11-05T15:15+05:30`, default
+  `sortBy=transfers`; option 2 was Sunday-only 09102 departing 8 Nov.
+- Root cause: the equal-transfer tie-break (both `compareJourneyOptions`
+  and the RAIL_ONLY branch of `compareMultimodalJourneyResults`) used road
+  access, then duration/practicality, and arrival only last. Duration and
+  road access ignore the wait for the first train.
+- Fixed: tie-break is now transfers → earliest final arrival → road access
+  → duration. Same-run boarding variants share their arrival, so the
+  DWX→SVDK road-access contract still holds (Dewas 12919 stays first).
+- Follow-up fixed the same day: the transfers-sort direct pass in
+  `railway-provider.service.ts` `executeSearch` kept one origin per
+  (destination, train) chosen by shortest in-vehicle time, i.e. the
+  farthest-downstream boarding, so 12402/19020 to KOTA showed only from
+  Roorkee/Jwalapur. It now sorts by door-to-door arrival → total road
+  access (destination access passed in via `searchRailwayProvider`'s
+  `destinationRoadAccessMinutes`). `findDirectPaths` also drops early-stop
+  alightings dominated under the `pruneUpstreamAlightingDetours` rule
+  before quotas, so slots aren't spent on variants the prune removes
+  (without it, HW→LMNR in the date-only DDN→Indore test was lost).
+  `searchEarliestPaths` still lacks that check (pre-existing).
+
 ## Current implementation state
 
 The following changes are present in the working tree and were intentionally
@@ -1297,6 +1320,28 @@ made as one performance/correctness effort:
   station field. The four "From"/"To" labels on `journey-results.html` gained
   parenthetical "(address)"/"(station)" hints, and `journey-results.css`
   gained a `.label-hint` rule, to disambiguate the two stacked row pairs.
+
+### Flight data source (2026-10-17)
+
+- Flights come from the project's own flight SQLite exports (Cleartrip /
+  MakeMyTrip collection runs), imported with
+  `npm run data:import-flights -- --file <export.sqlite>`
+  (`src/maintenance/import-flight-sqlite.ts`). Aviation Edge is no longer
+  used; its importer was removed. Search code reads
+  `aviation_flight_instances` exactly as before.
+- Only ACCEPTED direct flights are imported (user decision 2026-10-17;
+  NEEDS_REVIEW nearby-airport rows are skipped); connecting itineraries lack
+  per-leg times. Identity key `AIRLINE+NUMBER|DEP|ARR|departureUtcISO` matches the
+  old rows, so overlapping flights are updated, not duplicated.
+- Flights are deactivated (never deleted) only on routes/dates with a
+  COMPLETED search in the export.
+- All Aviation Edge flight rows, schedule imports and coverage were deleted by
+  migration `20261017150000_remove_aviation_edge_data` (user decision
+  2026-10-17). Airports/airlines were kept (needed by hubs, transfer links,
+  railway search) with Aviation Edge provider IDs cleared.
+- `data_source` (`AVIATION_EDGE` / `FLIGHT_SQLITE`) tags airports, airlines,
+  flights and import records. `aviation_flight_fares` stores fares for future
+  pricing; search does not read it yet.
 
 ## Concurrency, admission control, and production-readiness work
 
@@ -1399,6 +1444,8 @@ Deferred / explicitly not done (flagged, not silently skipped):
 - `src/validators/journey-search.validator.ts`
 - `src/validators/multimodal-journey.validator.ts`
 - `src/repositories/multimodal-routing.repository.ts`
+- `src/maintenance/import-flight-sqlite.ts`, `src/maintenance/transport-hub-links.ts`
+- `prisma/migrations/20261017120000_flight_sqlite_source/migration.sql`
 - `src/services/journey-search.service.ts`
 - `src/services/multimodal-journey.service.ts`
 - `src/services/railway-provider.service.ts`

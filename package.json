@@ -14,7 +14,7 @@
     "test:rate-limiter": "npm run build && node --test --test-concurrency=1 tests/rate-limiter.test.js",
     "test:metrics": "npm run build && node --test --test-concurrency=1 tests/metrics.test.js",
     "data:import-trains": "python scripts/import_train_timetables.py",
-    "data:import-aviation": "npm run build && node dist/maintenance/import-aviation-edge.js",
+    "data:import-flights": "npm run build && node dist/maintenance/import-flight-sqlite.js",
     "prisma": "prisma"
   },
   "keywords": [],

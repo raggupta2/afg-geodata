@@ -79,6 +79,7 @@ type SearchLimits = {
     maxResults: number;
     latestOriginDepartureMinute?: number;
     sortBy: JourneySortOrder;
+    destinationRoadAccessMinutes: Map<string, number>;
 };
 
 export type RailwayRoutingLimits = {
@@ -975,7 +976,8 @@ function findDirectPaths(
     requestedDate: Date,
     maxResultsPerOrigin: number,
     searchHorizonDays: number,
-    latestOriginDepartureMinute?: number
+    latestOriginDepartureMinute: number | undefined,
+    destinationRoadAccessMinutes: Map<string, number>
 ): {
     paths: RailwayPath[];
     originsWithoutDirectPaths: RailwaySearchOrigin[];
@@ -984,7 +986,7 @@ function findDirectPaths(
     const originsWithoutDirectPaths: RailwaySearchOrigin[] = [];
 
     for (const origin of origins) {
-        const originPaths: RailwayPath[] = [];
+        let originPaths: RailwayPath[] = [];
         const keys = new Set<string>();
         const boardings = snapshot.boardingsByStation.get(origin.stationId)
             ?? [];
@@ -1025,6 +1027,37 @@ function findDirectPaths(
             }
         }
 
+        // Same rule as pruneUpstreamAlightingDetours() in
+        // journey-search.service.ts: getting off this origin's train at an
+        // earlier stop is dropped when the same train also reaches a later
+        // candidate stop needing no more road access. Applying it here,
+        // before the quotas below, keeps those certain-to-be-pruned
+        // variants from using up slots - otherwise an origin's one
+        // guaranteed slot in executeSearch() could go to an early stop
+        // (e.g. Dewas for an Indore search) and the same boarding to the
+        // real destination station never surfaced.
+        const pathsByTrain = new Map<string, RailwayPath[]>();
+        for (const path of originPaths) {
+            const trainId = path.connections[0].trainId;
+            const group = pathsByTrain.get(trainId);
+            if (group) group.push(path);
+            else pathsByTrain.set(trainId, [path]);
+        }
+        const destinationAccess = (path: RailwayPath) =>
+            destinationRoadAccessMinutes.get(path.destinationStationId);
+        originPaths = originPaths.filter(candidate => {
+            const candidateAccess = destinationAccess(candidate);
+            if (candidateAccess === undefined) return true;
+            return !pathsByTrain.get(candidate.connections[0].trainId)?.some(
+                other => {
+                    const otherAccess = destinationAccess(other);
+                    return other !== candidate
+                        && otherAccess !== undefined
+                        && other.arrivalMinute > candidate.arrivalMinute
+                        && otherAccess <= candidateAccess;
+                }
+            );
+        });
         originPaths.sort((left, right) =>
             left.arrivalMinute - right.arrivalMinute
             || left.departureMinute - right.departureMinute
@@ -1130,6 +1163,25 @@ async function executeSearch(
     // a later direct service is popped. Resolve direct services first when the
     // requested primary key is transfer count, then fill only the open slots.
     if (limits.sortBy === "transfers") {
+        // Boardings of the same train run share their arrival, and the
+        // shortest in-vehicle time always belongs to the stop farthest down
+        // the line - so a duration tie-break here made Pass 1 below pick
+        // that farther stop (e.g. Roorkee) over the traveler's own station
+        // (e.g. Haridwar) on the same train. Order instead as the final
+        // compareJourneyOptions() does: door-to-door arrival (train arrival
+        // plus road access from the alighting station), then total road
+        // access, then the existing keys - so an origin's per-origin slot
+        // also goes to the alighting stop nearest the real destination
+        // rather than an earlier stop reached by a longer road leg.
+        const roadAccessByOrigin = new Map(
+            origins.map(origin => [origin.stationId, origin.roadAccessMinutes])
+        );
+        const destinationAccess = (path: RailwayPath) =>
+            limits.destinationRoadAccessMinutes.get(path.destinationStationId)
+            ?? 0;
+        const roadAccess = (path: RailwayPath) =>
+            (roadAccessByOrigin.get(path.originStationId) ?? 0)
+            + destinationAccess(path);
         const direct = findDirectPaths(
             snapshot,
             origins,
@@ -1137,9 +1189,14 @@ async function executeSearch(
             requestedDate,
             limits.maxResults,
             routingLimits.searchHorizonDays,
-            limits.latestOriginDepartureMinute
+            limits.latestOriginDepartureMinute,
+            limits.destinationRoadAccessMinutes
         ).paths.sort((left, right) =>
-            comparePaths(left, right, limits.sortBy)
+            pathTransferCount(left) - pathTransferCount(right)
+            || left.arrivalMinute + destinationAccess(left)
+                - right.arrivalMinute - destinationAccess(right)
+            || roadAccess(left) - roadAccess(right)
+            || comparePaths(left, right, limits.sortBy)
         );
         // Same fairness problem one level up: this merges direct paths
         // across every origin AND every candidate destination. Capping
@@ -1188,10 +1245,9 @@ async function executeSearch(
         }
         // Pass 1 guarantees every distinct (destination, train) pair a
         // representative, but always picks whichever origin's version of
-        // that pair sorts first in the shared arrival/duration order - for
-        // the same scheduled arrival, that is always the origin with the
-        // SHORTEST in-vehicle time, i.e. the one boarding CLOSEST to the
-        // destination. A farther-but-still-legitimate origin can then go
+        // that pair sorts first in the shared arrival/road-access order -
+        // for the same scheduled arrival, that is the origin needing the
+        // LEAST road access. Any other legitimate origin can then go
         // completely unrepresented even when every candidate boarding
         // station is supposed to be searched independently (this is the
         // same class of bug the origin-aware directServiceKey() fixed for
@@ -1286,7 +1342,8 @@ export async function searchRailwayProvider(
     maxResults: number,
     routingLimits: RailwayRoutingLimits,
     latestOriginDepartureMinute?: number,
-    sortBy: JourneySortOrder = "transfers"
+    sortBy: JourneySortOrder = "transfers",
+    destinationRoadAccessMinutes: Map<string, number> = new Map()
 ): Promise<RailwayProviderResult> {
     if (origins.length === 0 || destinationStationIds.size === 0) {
         return {
@@ -1302,9 +1359,16 @@ export async function searchRailwayProvider(
             .sort((left, right) =>
                 left.stationId.localeCompare(right.stationId)
             )
-            .map(origin => `${origin.stationId}:${origin.readyMinute}`)
+            .map(origin =>
+                `${origin.stationId}:${origin.readyMinute}:${origin.roadAccessMinutes}`
+            )
             .join(","),
-        [...destinationStationIds].sort().join(","),
+        [...destinationStationIds]
+            .sort()
+            .map(stationId =>
+                `${stationId}:${destinationRoadAccessMinutes.get(stationId) ?? 0}`
+            )
+            .join(","),
         maxResults,
         latestOriginDepartureMinute ?? "none",
         sortBy,
@@ -1319,7 +1383,12 @@ export async function searchRailwayProvider(
                 origins,
                 destinationStationIds,
                 requestedDate,
-                { maxResults, latestOriginDepartureMinute, sortBy },
+                {
+                    maxResults,
+                    latestOriginDepartureMinute,
+                    sortBy,
+                    destinationRoadAccessMinutes
+                },
                 routingLimits
             )
         )
