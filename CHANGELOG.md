@@ -22,8 +22,12 @@ not any agent's private memory — is the source of truth for "where are we".
 
 ---
 
-## Current status (updated 2026-10-21)
+## Current status (updated 2026-10-22)
 
+- **Update 2026-10-22:** commit `68d471b` deployed to the server (Node
+  v20.19.6, not to be upgraded). Flight importer switched from `node:sqlite`
+  to `sql.js` so it runs there; committed to `main` (not pushed). See the last
+  log entry.
 - **Update 2026-10-21 (later):** RAIL_ONLY ranking fix — under the default
   `sortBy=transfers`, equal-transfer trains are now ordered by earliest final
   arrival before road access / duration (`journey-search.service.ts`
@@ -434,3 +438,56 @@ and `CONVERSATION_MEMORY.md` for details.
   still appear from there (e.g. RK→DWX in the LMNR search). Pre-existing,
   already flagged in PROJECT_MEMORY.
 - **Next:** commit when the user asks; restart running servers.
+
+### 2026-10-22 — Server deployment steps after pushing 68d471b (Claude Code, Opus 5.5)
+
+- **Why:** user pushed `main` (`68d471b`, flight SQLite import + ranking
+  fixes) and pulled it on the server; asked what to do next.
+- **Answer given (no code changed, no commands run against any DB/server):**
+  on the server — back up the DB (migration
+  `20261017150000_remove_aviation_edge_data` deletes Aviation Edge flights),
+  `npm ci`, `npx prisma generate`, `npx prisma migrate deploy`, `npm run
+  build`, copy the flight exports (`data/flight-exports/` is git-ignored)
+  and run `npm run data:import-flights -- --file …` (dry run first, oldest
+  export first), then restart the Node process. Importer needs Node with
+  `node:sqlite` (22.13+; local is v26).
+- **Note:** `data/flight-exports/flights-2026-10-22T06-18-49-107Z.sqlite`
+  exists locally but no log entry records importing it.
+- **Next:** unchanged from "Next steps".
+- **Follow-up (same day):** server runs Node v20.19.6, so the importer fails
+  with `ERR_UNKNOWN_BUILTIN_MODULE: node:sqlite`. Advised running the import
+  with Node 22.13+/24 via nvm (app can stay on Node 20); no code changed.
+  Migrations reported as not touching railway/train tables.
+- **Follow-up 2:** user does not want to change the server's Node version.
+  Advised running the importer from the local machine (Node 26) against the
+  server DB over an SSH tunnel (`DATABASE_URL` set in the shell wins over
+  `.env`, since `dotenv/config` does not override). Alternative, not done:
+  switch the importer from `node:sqlite` to a Node 20-compatible package
+  (needs user OK — code change).
+
+### 2026-10-22 — Flight importer runs on Node 20 (sql.js instead of node:sqlite) (Claude Code, Opus 5.5)
+
+- **Why:** user asked to make the importer work on the server's Node
+  v20.19.6 without upgrading Node there.
+- **Changed:**
+  - `src/maintenance/import-flight-sqlite.ts`: reads the export with
+    `sql.js` (SQLite compiled to WebAssembly; no native build, no install
+    scripts, no Node version requirement) instead of `node:sqlite`.
+    `readSource` is now async and takes the file bytes already read for the
+    checksum; queries go through a small `queryAll` helper. Import logic,
+    SQL and Postgres writes are unchanged.
+  - `package.json` / `package-lock.json`: `sql.js@1.14.2` (dependency),
+    `@types/sql.js@1.4.11` (dev). 1.14.2 chosen over the newest 1.15.x
+    (released days ago).
+- **Verification (no Postgres access):** `npx tsc --noEmit` clean;
+  `npm run build` clean. A scratch script ran every importer query plus the
+  schema PRAGMAs against `flights-2026-10-22T06-18-49-107Z.sqlite` with both
+  `node:sqlite` and `sql.js`: all 11 result sets identical (3,432 direct
+  flights, 12,482 fares, 899 covered routes). sql.js loaded and queried the
+  export under Node v20.19.6 (via `npx node@20.19.6`). Importer dry run
+  against a database not run. Committed to `main` on user request (not pushed).
+- **Server steps:** pull, `npm ci`, `npx prisma generate`, then
+  `npm run data:import-flights -- --file <export> --dry-run`, then without
+  `--dry-run`.
+- **Note:** `npm audit` reports 9 pre-existing vulnerabilities (sql.js has
+  no dependencies); not addressed.

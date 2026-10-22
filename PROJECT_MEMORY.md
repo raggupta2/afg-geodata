@@ -1329,6 +1329,9 @@ made as one performance/correctness effort:
   (`src/maintenance/import-flight-sqlite.ts`). Aviation Edge is no longer
   used; its importer was removed. Search code reads
   `aviation_flight_instances` exactly as before.
+- The importer reads exports with `sql.js` (WebAssembly), not `node:sqlite`,
+  so it runs on Node 20 (the server runs v20.19.6 and must not be upgraded;
+  user decision 2026-10-22).
 - Only ACCEPTED direct flights are imported (user decision 2026-10-17;
   NEEDS_REVIEW nearby-airport rows are skipped); connecting itineraries lack
   per-leg times. Identity key `AIRLINE+NUMBER|DEP|ARR|departureUtcISO` matches the

@@ -2,7 +2,7 @@ import "dotenv/config";
 import { createHash } from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
-import { DatabaseSync } from "node:sqlite";
+import initSqlJs, { type Database } from "sql.js";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../config/database";
 import { linkAirportHubs, refreshGeographyAndTransfers } from "./transport-hub-links";
@@ -185,11 +185,22 @@ function sha256Hex(data: string | Buffer): string {
     return createHash("sha256").update(data).digest("hex");
 }
 
-function validateSourceSchema(database: DatabaseSync): void {
+function queryAll(database: Database, sql: string): SqliteRow[] {
+    const statement = database.prepare(sql);
+    try {
+        const rows: SqliteRow[] = [];
+        while (statement.step()) rows.push(statement.getAsObject() as SqliteRow);
+        return rows;
+    } finally {
+        statement.free();
+    }
+}
+
+function validateSourceSchema(database: Database): void {
     const missing: string[] = [];
     for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
         const present = new Set(
-            (database.prepare(`PRAGMA table_info(${table})`).all() as SqliteRow[])
+            queryAll(database, `PRAGMA table_info(${table})`)
                 .map(row => String(row.name))
         );
         if (present.size === 0) {
@@ -205,15 +216,18 @@ function validateSourceSchema(database: DatabaseSync): void {
     }
 }
 
-function readSource(file: string): SourceData {
-    const database = new DatabaseSync(file, { readOnly: true });
+// sql.js (WebAssembly) instead of node:sqlite so the importer runs on Node 20.
+// It opens an in-memory copy of the export; the file itself is never written.
+async function readSource(raw: Buffer): Promise<SourceData> {
+    const SQL = await initSqlJs();
+    const database = new SQL.Database(raw);
     try {
         validateSourceSchema(database);
-        const airports = (database.prepare(`
+        const airports = queryAll(database, `
             SELECT iata_code, name, latitude, longitude, timezone
             FROM airports
             WHERE country_code = 'IN' AND is_active = 1
-        `).all() as SqliteRow[]).flatMap(row => {
+        `).flatMap(row => {
             const iataCode = code(row.iata_code, 3);
             const name = text(row.name, 200);
             const latitude = numberValue(row.latitude);
@@ -229,7 +243,7 @@ function readSource(file: string): SourceData {
         });
 
         // Accepted direct flights only.
-        const flights = (database.prepare(`
+        const flights = queryAll(database, `
             SELECT
                 flight.id,
                 provider.name AS provider,
@@ -258,7 +272,7 @@ function readSource(file: string): SourceData {
                   WHERE other.flight_id = flight.id AND other.segment_number > 1
               )
             ORDER BY flight.id
-        `).all() as SqliteRow[]).map(row => ({
+        `).map(row => ({
             sqliteId: Number(row.id),
             provider: text(row.provider, 50) ?? "UNKNOWN",
             sourceRecordId: text(row.source_record_id, 100),
@@ -276,12 +290,12 @@ function readSource(file: string): SourceData {
             aircraftType: text(row.aircraft_type, 100)
         }));
 
-        const fares = (database.prepare(`
+        const fares = queryAll(database, `
             SELECT fare.*, provider.name AS provider
             FROM fares fare
             JOIN providers provider ON provider.id = fare.provider_id
             ORDER BY fare.id
-        `).all() as SqliteRow[]).map(row => ({
+        `).map(row => ({
             flightId: Number(row.flight_id),
             provider: text(row.provider, 50) ?? "UNKNOWN",
             fareFamily: text(row.fare_family, 100),
@@ -303,11 +317,11 @@ function readSource(file: string): SourceData {
 
         // Only a completed search proves which flights a route has on a date.
         // Failed or "no results" pages are not trusted to remove flights.
-        const coveredRoutes = (database.prepare(`
+        const coveredRoutes = queryAll(database, `
             SELECT DISTINCT origin_code, destination_code, departure_date
             FROM search_sessions
             WHERE collection_status = 'COMPLETED'
-        `).all() as SqliteRow[]).flatMap(row => {
+        `).flatMap(row => {
             const originCode = code(row.origin_code, 3);
             const destinationCode = code(row.destination_code, 3);
             const serviceDate = text(row.departure_date, 10);
@@ -317,11 +331,11 @@ function readSource(file: string): SourceData {
         });
 
         const tallies = new Map<string, RowTally>();
-        for (const row of database.prepare(`
+        for (const row of queryAll(database, `
             SELECT origin_code, departure_date, validation_status, COUNT(*) AS rows
             FROM flights
             GROUP BY origin_code, departure_date, validation_status
-        `).all() as SqliteRow[]) {
+        `)) {
             const originCode = code(row.origin_code, 3);
             const serviceDate = text(row.departure_date, 10);
             if (!originCode || !serviceDate) continue;
@@ -580,7 +594,7 @@ async function main(): Promise<void> {
         }
     }
 
-    const source = readSource(options.file);
+    const source = await readSource(raw);
     const airports = await loadAirports();
     const addedAirports = options.dryRun
         ? source.airports.filter(airport => !airports.has(airport.iataCode)).map(airport => airport.iataCode)
