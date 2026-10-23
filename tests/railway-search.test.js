@@ -74,7 +74,7 @@ test("journey search applies coordinate-search defaults", () => {
     assert.equal(result.options.destinationCandidateLimit, 4);
     assert.equal(result.options.boardingStationLimit, 5);
     assert.equal(result.options.resultLimit, 5);
-    assert.equal(result.options.sortBy, "transfers");
+    assert.equal(result.options.sortBy, "recommended");
 });
 
 test("journey search rejects more than five results", () => {
@@ -215,10 +215,15 @@ test("station autocomplete returns station coordinates for codes and names", asy
 });
 
 test("coordinate search returns ranked nearby-station journeys", async () => {
+    // The ordering checks below are for the fewest-transfers sort, which is
+    // no longer the default, so request it explicitly.
     const response = await fetch(`${baseUrl}/api/v1/railways/search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody)
+        body: JSON.stringify({
+            ...requestBody,
+            options: { ...requestBody.options, sortBy: "transfers" }
+        })
     });
     const body = await response.json();
 

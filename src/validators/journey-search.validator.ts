@@ -50,8 +50,8 @@ const optionSchema = z.object({
     routesPerBoardingStation: z.number().int().min(1).max(5).default(3),
     resultLimit: z.number().int().min(1).max(RAILWAY_DIRECT_SEARCH_RESULT_LIMIT)
         .default(RAILWAY_DIRECT_SEARCH_RESULT_LIMIT),
-    sortBy: z.enum(["transfers", "duration", "departure", "arrival"])
-        .default("transfers")
+    sortBy: z.enum(["recommended", "transfers", "duration", "departure", "arrival"])
+        .default("recommended")
 }).strict();
 
 const searchSchema = z.object({

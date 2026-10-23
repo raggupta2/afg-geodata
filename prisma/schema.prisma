@@ -465,6 +465,7 @@ model JourneyRoutingPolicy {
   sameAirportFlightTransferMinutes Int      @default(30) @map("same_airport_flight_transfer_minutes")
   maximumTransfers                 Int      @default(3) @map("maximum_transfers")
   searchHorizonDays                Int      @default(3) @map("search_horizon_days")
+  transferPenaltyMinutes           Int      @default(240) @map("transfer_penalty_minutes")
   updatedAt                        DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@map("journey_routing_policies")

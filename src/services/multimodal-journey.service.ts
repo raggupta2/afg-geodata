@@ -192,6 +192,23 @@ const FIRST_HOP_MAX_FLIGHTS_TOTAL = 150;
 const ONWARD_HOP_MAX_FLIGHTS_PER_DESTINATION = 1;
 const ONWARD_HOP_MAX_FLIGHTS_TOTAL = 20;
 
+// How many flights per route (departure -> arrival airport) are loaded for the
+// whole search window. States reach a hub at many different times, so each
+// route needs flights spread across the window, not just its earliest ones;
+// the per-hop limits above still bound how many are expanded per state.
+const MAX_FLIGHTS_LOADED_PER_ROUTE = 150;
+
+// The search pops states in arrival-priority order and normally stops once
+// it has resultLimit matching journeys. That suits every sort keyed on
+// arrival, but "duration" can prefer a short trip that leaves and arrives
+// late, which the first resultLimit arrivals never reach. For "duration" the
+// search keeps collecting this many times resultLimit before stopping (still
+// bounded by the expanded-state budget); the final sort then keeps the
+// shortest resultLimit. 3 was measured on 6 city pairs: it cut the 20th
+// shortest Delhi -> Mumbai flight trip from 18h00m to 11h35m and stayed under
+// ~2s; exploring until the budget ran out took up to 29s for little more.
+const DURATION_SORT_COLLECTION_FACTOR = 3;
+
 // remainingTimeHeuristicMs() below only estimates straight-line time to the
 // FINAL destination, which gives a feeder rail leg (one taken before any
 // flight - see MAX_FEEDER_RAIL_LEGS_BEFORE_FLIGHT above) no credit at all
@@ -203,7 +220,7 @@ const ONWARD_HOP_MAX_FLIGHTS_TOTAL = 20;
 // ever reaching a productive one. This bonus only reorders which
 // same-tier, not-yet-flown state is explored first (it cannot change which
 // states are admitted, nor override scheduledLegs as the primary sort key
-// for "transfers" - the default and most heavily used sort), so it cannot
+// for "transfers"), so it cannot
 // cause a worse itinerary to be returned in place of a better one that was
 // already found; it can only help the search reach a productive one sooner.
 const FEEDER_TRANSFER_CONNECTIVITY_BONUS_MS = 3 * 60 * 60 * 1000;
@@ -418,7 +435,8 @@ export function selectMultimodalJourneyResults(
     results: MultimodalJourneyResult[],
     journeyTypes: JourneyTypeFilter[] | undefined,
     resultLimit: number,
-    sortBy: JourneySortOrder = "transfers"
+    sortBy: JourneySortOrder = "transfers",
+    transferPenaltyMinutes = 0
 ): MultimodalJourneyResult[] {
     const matching = journeyTypes?.length
         ? results.filter(result =>
@@ -426,7 +444,12 @@ export function selectMultimodalJourneyResults(
         : [...results];
     return matching
         .sort((left, right) =>
-            compareMultimodalResultsBy(left, right, sortBy)
+            compareMultimodalResultsBy(
+                left,
+                right,
+                sortBy,
+                transferPenaltyMinutes
+            )
         )
         .slice(0, resultLimit)
         .map((result, index) => ({ ...result, rank: index + 1 }));
@@ -438,6 +461,45 @@ export function isRailOnlyJourneyTypeSelection(
     return journeyTypes?.length === 1 && journeyTypes[0] === "RAIL_ONLY";
 }
 
+// The search starts every path at the requested time (road access, then the
+// boarding buffer) and waits at the hub until the first train/flight leaves.
+// Like the railway-only search's suggestedLeaveHomeAt, the shown journey
+// should instead leave home just early enough for that first boarding: shift
+// the road access and buffer to end at the first scheduled departure and drop
+// the idle wait in between. Waits between later services are kept.
+function alignOriginAccessToFirstBoarding(legs: MultimodalLeg[]): MultimodalLeg[] {
+    const firstScheduledIndex = legs.findIndex(leg =>
+        leg.mode === "RAIL" || leg.mode === "FLIGHT"
+    );
+    const originAccess = legs[0];
+    if (firstScheduledIndex <= 0 || originAccess?.mode !== "LOCAL") return legs;
+    const boardingMs = Date.parse(legs[firstScheduledIndex].departureAt);
+    const bufferMinutes = legs
+        .slice(1, firstScheduledIndex)
+        .find(leg => leg.transferType === "INITIAL_BOARDING_BUFFER")
+        ?.durationMinutes ?? 0;
+    const hubArrivalMs = boardingMs - bufferMinutes * 60_000;
+    const leaveHomeMs = hubArrivalMs - originAccess.durationMinutes * 60_000;
+    const hub = legs[firstScheduledIndex].from;
+    const prefix: MultimodalLeg[] = [{
+        ...originAccess,
+        departureAt: iso(leaveHomeMs),
+        arrivalAt: iso(hubArrivalMs)
+    }];
+    if (bufferMinutes > 0) {
+        prefix.push({
+            mode: "WAIT",
+            from: hub,
+            to: hub,
+            departureAt: iso(hubArrivalMs),
+            arrivalAt: iso(boardingMs),
+            durationMinutes: bufferMinutes,
+            transferType: "INITIAL_BOARDING_BUFFER"
+        });
+    }
+    return [...prefix, ...legs.slice(firstScheduledIndex)];
+}
+
 function resultFromState(
     state: SearchState,
     destinationHub: NearbyRoutingHub,
@@ -445,7 +507,7 @@ function resultFromState(
     policy: Policy
 ): MultimodalJourneyResult {
     const destination = endpointPlace(request, "DESTINATION");
-    let completionLegs = state.legs;
+    let completionLegs = alignOriginAccessToFirstBoarding(state.legs);
     let completionHub = place(destinationHub);
     let completionHubId = destinationHub.id;
     let completionMs = state.arrivalMs;
@@ -706,11 +768,35 @@ export function compareMultimodalJourneyResults(
         || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt);
 }
 
+// Same idea as the railway engine's recommendedScoreMs(): rank by final
+// arrival (every candidate shares the search start) plus the policy's cost
+// per transfer. The practicality extras that are not about transfer count -
+// flight distance, flight-to-flight overhead, long layovers, detours - are
+// kept, so flight ranking keeps its existing signals; only the small generic
+// TRANSFER_PENALTY_MINUTES is replaced by the policy value.
+function recommendedScoreMinutes(
+    result: MultimodalJourneyResult,
+    transferPenaltyMinutes: number
+): number {
+    const practicalityExtras = practicalityScore(result)
+        - result.totalJourneyMinutes
+        - result.numberOfTransfers * TRANSFER_PENALTY_MINUTES;
+    return Date.parse(result.finalArrivalAt) / 60_000
+        + result.numberOfTransfers * transferPenaltyMinutes
+        + practicalityExtras;
+}
+
 function compareMultimodalResultsBy(
     left: MultimodalJourneyResult,
     right: MultimodalJourneyResult,
-    sortBy: JourneySortOrder
+    sortBy: JourneySortOrder,
+    transferPenaltyMinutes: number
 ): number {
+    if (sortBy === "recommended") {
+        return recommendedScoreMinutes(left, transferPenaltyMinutes)
+            - recommendedScoreMinutes(right, transferPenaltyMinutes)
+            || compareMultimodalJourneyResults(left, right);
+    }
     if (sortBy === "duration") {
         return left.totalJourneyMinutes - right.totalJourneyMinutes
             || compareMultimodalJourneyResults(left, right);
@@ -867,7 +953,7 @@ async function executeSearch(
         loadFlightInstances(
             requested,
             horizonEnd,
-            FIRST_HOP_MAX_FLIGHTS_TOTAL
+            MAX_FLIGHTS_LOADED_PER_ROUTE
         ),
         allowRailExpansion
             ? loadTransferLinks(MAX_TRANSFER_TARGETS_PER_HUB)
@@ -966,11 +1052,14 @@ async function executeSearch(
     let expandedStates = 0;
     let truncated = false;
     let matchingResultCount = 0;
+    const collectionLimit = request.options.sortBy === "duration"
+        ? request.options.resultLimit * DURATION_SORT_COLLECTION_FACTOR
+        : request.options.resultLimit;
     const railExpansionsByHub = new Map<string, number>();
 
     while (
         queue.length > 0
-        && matchingResultCount < request.options.resultLimit
+        && matchingResultCount < collectionLimit
     ) {
         const state = queue.pop();
         if (!state) break;
@@ -1009,12 +1098,12 @@ async function executeSearch(
                         [...results.values()]
                     );
                     matchingResultCount = Math.min(
-                        request.options.resultLimit,
+                        collectionLimit,
                         pruneRedundantContinuations(accessPruned).length
                     );
                 }
             }
-            if (matchingResultCount >= request.options.resultLimit) break;
+            if (matchingResultCount >= collectionLimit) break;
         }
         if (state.scheduledLegs >= maximumScheduledLegs) continue;
 
@@ -1222,7 +1311,8 @@ async function executeSearch(
         combined,
         request.options.journeyTypes,
         request.options.resultLimit,
-        request.options.sortBy
+        request.options.sortBy,
+        policy.transferPenaltyMinutes
     );
     const available = coverage.counts.get("AVAILABLE") ?? 0;
     const empty = coverage.counts.get("EMPTY_REPORTED") ?? 0;
@@ -1250,7 +1340,8 @@ async function executeSearch(
             railToRailMinutes: policy.railToRailMinutes,
             sameAirportFlightTransferMinutes: policy.sameAirportFlightTransferMinutes,
             maximumTransfers,
-            searchHorizonDays: policy.searchHorizonDays
+            searchHorizonDays: policy.searchHorizonDays,
+            transferPenaltyMinutes: policy.transferPenaltyMinutes
         },
         coverage: {
             status: flights.length === 0
@@ -1285,7 +1376,8 @@ async function executeRailOnlySearch(
         railwayOnly.trainResults.map(convertRailwayResult),
         undefined,
         request.options.resultLimit,
-        request.options.sortBy
+        request.options.sortBy,
+        policy.transferPenaltyMinutes
     );
 
     return {
@@ -1307,7 +1399,8 @@ async function executeRailOnlySearch(
             railToRailMinutes: policy.railToRailMinutes,
             sameAirportFlightTransferMinutes: policy.sameAirportFlightTransferMinutes,
             maximumTransfers,
-            searchHorizonDays: policy.searchHorizonDays
+            searchHorizonDays: policy.searchHorizonDays,
+            transferPenaltyMinutes: policy.transferPenaltyMinutes
         },
         coverage: {
             status: "RAIL_ONLY",
@@ -1333,7 +1426,8 @@ function paginateCachedSearchResult(
         result.journeyResults,
         request.options.journeyTypes,
         request.options.resultLimit,
-        request.options.sortBy
+        request.options.sortBy,
+        result.policy.transferPenaltyMinutes
     );
     const offset = Math.min(
         request.options.resultOffset ?? 0,
@@ -1373,7 +1467,7 @@ export async function searchMultimodalJourneys(
                 request.options.resultLimit,
                 JOURNEY_RESULT_LIMIT
             ),
-            sortBy: request.options.sortBy ?? "transfers"
+            sortBy: request.options.sortBy ?? "recommended"
         }
     };
     const searchRequest: MultimodalSearchInput = {

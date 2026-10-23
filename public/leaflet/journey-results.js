@@ -6,6 +6,7 @@ const MAX_JOURNEYS = 20;
 const SCHEDULED_MODES = new Set(["RAIL", "FLIGHT"]);
 const mobileFilterMedia = window.matchMedia("(max-width: 780px)");
 const DEFAULT_JOURNEY_TYPE = "RAIL_ONLY";
+const DEFAULT_SORT = "recommended";
 const JOURNEY_TYPE_SERVER_FILTERS = {
     RAIL_ONLY: ["RAIL_ONLY"],
     FLIGHT_ONLY: ["FLIGHT_ONLY"],
@@ -952,11 +953,8 @@ function journeyTypeLabel(journey) {
 function placeLabel(place, fallback) {
     const currentLabel = String(place?.name || fallback);
     if (place?.kind !== "AIRPORT") return currentLabel;
-    const city = String(place.city || "").trim();
     const iata = String(place.code || "").trim().toUpperCase();
-    return city && iata
-        ? `${currentLabel} ${city} (${iata})`
-        : currentLabel;
+    return iata ? `${currentLabel} (${iata})` : currentLabel;
 }
 
 function journeyBadgeClass(journey) {
@@ -987,7 +985,7 @@ function toggleQuickFilter(filter) {
 
 function clearFilters() {
     const hadJourneyTypeFilter = selectedJourneyType() !== DEFAULT_JOURNEY_TYPE;
-    const hadNonDefaultSort = elements.sortBy.value !== "transfers";
+    const hadNonDefaultSort = elements.sortBy.value !== DEFAULT_SORT;
     resetFilterControls();
     configureTransferFilter();
     closeFilters();
@@ -1012,7 +1010,7 @@ function resetFilterControls() {
         elements.departureAfter, elements.departureBefore,
         elements.arrivalAfter, elements.arrivalBefore
     ]) input.value = "";
-    elements.sortBy.value = "transfers";
+    elements.sortBy.value = DEFAULT_SORT;
 }
 
 function renderActiveFilters() {
@@ -1087,7 +1085,7 @@ function hasActiveFilters() {
         || Boolean(elements.arrivalBefore.value)
         || checkedValues('input[name="airline"]').length > 0
         || selectedJourneyType() !== DEFAULT_JOURNEY_TYPE
-        || elements.sortBy.value !== "transfers";
+        || elements.sortBy.value !== DEFAULT_SORT;
 }
 
 function withinTimeRange(value, after, before) {

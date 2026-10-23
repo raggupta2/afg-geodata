@@ -1162,7 +1162,10 @@ async function executeSearch(
     // An arrival-ordered cutoff can fill all five slots with connections before
     // a later direct service is popped. Resolve direct services first when the
     // requested primary key is transfer count, then fill only the open slots.
-    if (limits.sortBy === "transfers") {
+    // "recommended" also needs every direct service in the pool, but ranks
+    // them against connections by arrival, so it keeps the full search below.
+    const recommended = limits.sortBy === "recommended";
+    if (limits.sortBy === "transfers" || recommended) {
         // Boardings of the same train run share their arrival, and the
         // shortest in-vehicle time always belongs to the stop farthest down
         // the line - so a duration tie-break here made Pass 1 below pick
@@ -1292,7 +1295,7 @@ async function executeSearch(
             );
             directPaths.push(path);
         }
-        if (directPaths.length >= limits.maxResults) {
+        if (!recommended && directPaths.length >= limits.maxResults) {
             return {
                 graphVersion: snapshot.version,
                 paths: directPaths,
@@ -1306,21 +1309,58 @@ async function executeSearch(
         destinationStationIds,
         routingLimits.maxTrainLegs
     );
+    const resultKeys = new Set<string>();
+    // "recommended" ranks by final arrival plus a per-transfer penalty, so
+    // it explores like "arrival" and is not capped by the direct pass: a
+    // connection arriving days earlier must still be able to enter the pool.
     const search = await searchEarliestPaths(
         snapshot,
         minimumRemainingLegs,
         origins,
         destinationStationIds,
         requestedDate,
-        limits.maxResults - directPaths.length,
+        recommended
+            ? limits.maxResults
+            : limits.maxResults - directPaths.length,
         maxResultsPerOrigin,
-        new Set<string>(),
+        resultKeys,
         trainKeys,
         routingLimits,
         limits.latestOriginDepartureMinute,
-        limits.sortBy
+        recommended ? "arrival" : limits.sortBy
     );
-    const paths = [...directPaths, ...search.paths].sort((left, right) =>
+    let earliestPaths = search.paths;
+    let truncated = search.truncated;
+    let truncationReason = search.reason;
+    // Departure-ordered exploration expands every early first train's
+    // transfer tree before any later one, so on a long multi-transfer route
+    // (e.g. DDN -> MAS) it can exhaust MAX_EXPANDED_STATES without completing
+    // a single path and return nothing. When it truncates short, fill the
+    // remaining slots with the arrival-ordered exploration, which reaches the
+    // destination quickly; the shared resultKeys/trainKeys keep it from
+    // re-admitting anything already found, and the final comparePaths() /
+    // compareJourneyOptions() sorts still order everything by departure.
+    const openSlots = limits.maxResults - directPaths.length - search.paths.length;
+    if (limits.sortBy === "departure" && search.truncated && openSlots > 0) {
+        const fallback = await searchEarliestPaths(
+            snapshot,
+            minimumRemainingLegs,
+            origins,
+            destinationStationIds,
+            requestedDate,
+            openSlots,
+            maxResultsPerOrigin,
+            resultKeys,
+            trainKeys,
+            routingLimits,
+            limits.latestOriginDepartureMinute,
+            "arrival"
+        );
+        earliestPaths = [...search.paths, ...fallback.paths];
+        truncated = fallback.truncated;
+        truncationReason = fallback.reason;
+    }
+    const paths = [...directPaths, ...earliestPaths].sort((left, right) =>
         comparePaths(left, right, limits.sortBy)
         || left.connections[0].trainId.localeCompare(
             right.connections[0].trainId
@@ -1330,8 +1370,8 @@ async function executeSearch(
     return {
         graphVersion: snapshot.version,
         paths,
-        searchComplete: !search.truncated,
-        truncationReason: search.reason
+        searchComplete: !truncated,
+        truncationReason
     };
 }
 

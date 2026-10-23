@@ -15,6 +15,7 @@ export const JOURNEY_RESULT_LIMIT = 20;
 export const RAILWAY_DIRECT_SEARCH_RESULT_LIMIT = 5;
 
 export type JourneySortOrder =
+    | "recommended"
     | "transfers"
     | "duration"
     | "departure"

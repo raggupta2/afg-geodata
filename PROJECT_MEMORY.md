@@ -2022,3 +2022,98 @@ each change (not only at the end):
     pre-existing, unrelated grouping regression above);
     `npm run test:multimodal-search` 22/23 pass (the 1 failure is the
     pre-existing, unrelated `RAIL_TO_FLIGHT` issue above).
+
+### `sortBy=departure` returned 0 Train-only results on a long route (DDN → MAS, 2026-10-28 16:30) — fixed 2026-10-22
+
+- **Root cause 1:** in the threshold mode (`searchCoordinateRailwayDeparturesAfter`,
+  used for every RAIL_ONLY search), each origin's provider `readyMinute`
+  was the requested time alone. The provider admitted trains the traveller
+  could not reach by road, and `buildOption()` threw them away later. Under
+  departure ordering these unreachable early trains used up the
+  exploration budget, and their `journeyKey` (origin + alighting stations)
+  blocked reachable paths with the same stops.
+  **Fix:** `readyMinute = requested + road access` in that mode. This is
+  exactly `buildOption()`'s rejection bound (the boarding buffer may still
+  shrink), so it removes only candidates that were already discarded.
+  Date-only searches still admit from minute 0, and the `buildOption()`
+  check remains their guard.
+- **Root cause 2:** departure-ordered `searchEarliestPaths` expands every
+  early first train's transfer tree before any later one. On a ~40 h route
+  it hits `MAX_EXPANDED_STATES` with few or no completed paths.
+  **Fix:** in `railway-provider.service.ts` `executeSearch`, when the
+  departure search truncates with open slots, fill them with an
+  arrival-ordered `searchEarliestPaths` that shares `resultKeys`/`trainKeys`.
+  The final sorts still order by departure.
+- **Result:** DDN → MAS departure sort went from 0 to 14 results. The other
+  sorts gained 1–2 previously crowded-out valid options. DWX → SVDK
+  departure gives 16 results with non-decreasing leave times.
+- **Still open:** latency. Departure sort on long routes still spends
+  ~11–14 s in the departure pass before truncating. The known backtracking
+  variants (e.g. UJN → DWX, SRE → RK first legs) can still appear.
+
+### "Recommended" sort (2026-10-23)
+
+- `sortBy=recommended` ranks by final arrival + transfers ×
+  `journey_routing_policies.transfer_penalty_minutes` (default 240). Every
+  candidate shares the search start, so arrival alone stands in for "time
+  from search". A direct train wins over a connection only if it arrives
+  within the penalty.
+- Multimodal keeps the practicality extras (flight km, flight-transfer
+  overhead, long layovers, detours) and swaps only the 25-min generic
+  transfer cost for the policy value.
+- The provider collects candidates via the direct-train pass (no early
+  return) plus an arrival-ordered search with the full budget. Ranking alone
+  cannot fix the pool: the transfers sort fills slots with direct trains
+  first.
+- **It is the default** since 2026-10-23 (user approved after reviewing
+  the before/after comparison): both validators, the request-level
+  fallbacks, the HTML `selected` option and `DEFAULT_SORT` in
+  `journey-results.js`. Internal helper defaults stay `"transfers"`.
+
+### Boarding buffer is a hard rule for train journeys (2026-10-23)
+
+- A train journey is offered only if the traveller reaches the boarding
+  station at least `initial_rail_buffer_minutes` before departure. When the
+  backward leave-home time would be before the search time, the journey is
+  dropped (`buildOption()` returns null) instead of being shown with a
+  squeezed boarding wait.
+- In threshold mode the provider's `readyMinute` is requested + road +
+  buffer to match. A user-requested "Tight connection" UI warning was tried
+  and removed the same day: the user wants these journeys hidden, not
+  flagged.
+
+### Flight loading is capped per route (2026-10-23)
+
+- `loadFlightInstances` caps at `MAX_FLIGHTS_LOADED_PER_ROUTE` (150) per
+  departure → arrival airport over the search window. The old cap was per
+  departure airport, earliest first: from a 06:00 search, DEL kept only
+  flights to about 11:05 and hid later directs (DEL → IXE 17:30).
+- The multimodal search stops at its collection limit, in arrival-priority
+  order. For "duration" that limit is `resultLimit × DURATION_SORT_COLLECTION_FACTOR`
+  (3; measured: big gains, ≤ ~2 s; unlimited took up to 29 s). A short trip
+  that arrives very late can still be missed when the budget runs out first.
+  Known case: DED → AMD Mixed 6E6713 + local train 20987, which the plain
+  flight dominates anyway.
+
+### Airport hub coordinates from Aviation Edge are often city centres (2026-10-23)
+
+- Many airport hubs in `transport_hubs` were created by the old Aviation Edge
+  importer and hold city-centre points (round arc-minute values), e.g. DED at
+  Dehradun city instead of Jolly Grant, PAB at Bilaspur (HP) instead of
+  Bilaspur (CG). Road-access estimates (aerial × `road_detour_factor`) and
+  transfer links then use the wrong point.
+- Neither the flight SQLite migration nor `addMissingAirports` overwrites an
+  existing airport's coordinates, and `refreshGeographyAndTransfers` only
+  fills a NULL `geom` and never re-maps airport cities.
+- Fix: migration `20261023120000_fix_airport_hub_coordinates` (43 agreed
+  airports; VTZ, SXR and 17 precise 1–1.6 km offsets intentionally kept).
+  Backup in `maintenance_backups.airport_hub_coordinates_20261023`. Status:
+  applied to the local DB only (2026-10-23); not on the server.
+- Some `transport_cities` rows from the same source are also misplaced
+  (Bareli at Rae Bareli, Bilaspur in Himachal, Kota, Jabalpur, Deparizo), so
+  BEK, PAB and DEP have no city within 60 km and no transfer links.
+  Migration `20261023140000_fix_city_coordinates` fixes Bilaspur, Bareli,
+  Kota, Jabalpur (Deparizo kept); applied to the local DB only (2026-10-23).
+- Airport hub names are also old Aviation Edge values (133 of 165 differ
+  from the SQLite export). Migration `20261023130000_airport_hub_names` sets
+  132 of them (VTZ kept); applied to the local DB only (2026-10-23).

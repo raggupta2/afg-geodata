@@ -54,7 +54,7 @@ test("multimodal search applies bounded phase-one defaults", () => {
     assert.equal(result.options.resultOffset, undefined);
     assert.equal(result.options.pageSize, undefined);
     assert.equal(result.options.resultLimit, 20);
-    assert.equal(result.options.sortBy, "transfers");
+    assert.equal(result.options.sortBy, "recommended");
     assert.equal(result.departureAt, "2026-09-07T08:00:00+05:30");
 });
 
@@ -216,6 +216,59 @@ test("rail-only ranking prefers an earlier-arriving direct train over a shorter 
         selectMultimodalJourneyResults([later, earlier], undefined, 5)
             .map(item => item.id),
         ["earlier", "later"]
+    );
+});
+
+test("multimodal search accepts the recommended sort", () => {
+    const result = parseMultimodalSearch({
+        origin: { latitude: 30.3165, longitude: 78.0322 },
+        destination: { latitude: 23.0225, longitude: 72.5714 },
+        departureAt: "2026-09-07T08:00:00+05:30",
+        options: { sortBy: "recommended" }
+    });
+    assert.equal(result.options.sortBy, "recommended");
+});
+
+test("recommended ranking weighs final arrival against a per-transfer penalty", () => {
+    const railOnly = (id, departureAt, finalArrivalAt, transfers) => ({
+        id,
+        rank: 0,
+        journeyType: "RAIL_ONLY",
+        departureHub: {},
+        arrivalHub: {},
+        departureAt,
+        finalArrivalAt,
+        totalJourneyMinutes: Math.round(
+            (Date.parse(finalArrivalAt) - Date.parse(departureAt)) / 60_000
+        ),
+        numberOfTransfers: transfers,
+        scheduledLegs: transfers + 1,
+        modes: ["RAIL"],
+        legs: [{ mode: "LOCAL", durationMinutes: 0 }]
+    });
+    // Dehradun -> Chennai, 2026-10-28 16:30: the direct train leaves two days
+    // later and arrives 34h after a one-transfer journey leaving the same day.
+    const laterDirect = railOnly(
+        "laterDirect", "2026-10-30T08:52:00+05:30", "2026-11-01T02:10:00+05:30", 0
+    );
+    const sameDayTransfer = railOnly(
+        "sameDayTransfer", "2026-10-28T22:25:00+05:30", "2026-10-30T16:01:00+05:30", 1
+    );
+    assert.deepEqual(
+        selectMultimodalJourneyResults(
+            [laterDirect, sameDayTransfer], undefined, 5, "recommended", 240
+        ).map(item => item.id),
+        ["sameDayTransfer", "laterDirect"]
+    );
+    // A direct train arriving within the penalty of the connection still wins.
+    const nearDirect = railOnly(
+        "nearDirect", "2026-10-28T20:00:00+05:30", "2026-10-30T19:00:00+05:30", 0
+    );
+    assert.deepEqual(
+        selectMultimodalJourneyResults(
+            [sameDayTransfer, nearDirect], undefined, 5, "recommended", 240
+        ).map(item => item.id),
+        ["nearDirect", "sameDayTransfer"]
     );
 });
 
@@ -387,9 +440,9 @@ test("multimodal journey endpoint is registered and validates requests", async (
     assert.match(body.message, /multimodal journey search/i);
 });
 
-test("loadFlightInstances applies time, service, and per-airport limits in SQL", async t => {
-    const start = new Date("2026-09-18T00:00:00.000+05:30");
-    const end = new Date("2026-09-21T00:00:00.000+05:30");
+test("loadFlightInstances applies time, service, and per-route limits in SQL", async t => {
+    const start = new Date("2026-11-16T00:00:00.000+05:30");
+    const end = new Date("2026-11-19T00:00:00.000+05:30");
     const nonScheduledCount = await prisma.aviationAirline.count({
         where: { serviceType: { not: "scheduled" } }
     });
@@ -407,15 +460,50 @@ test("loadFlightInstances applies time, service, and per-airport limits in SQL",
     assert.ok(flights.every(flight =>
         flight.departureAt >= start && flight.departureAt <= end
     ));
-    const countsByDepartureHub = new Map();
+    const countsByRoute = new Map();
     for (const flight of flights) {
-        const hubId = flight.departureAirport.hub.id.toString();
-        countsByDepartureHub.set(
-            hubId,
-            (countsByDepartureHub.get(hubId) ?? 0) + 1
-        );
+        const route = `${flight.departureAirport.hub.id}>${flight.arrivalAirport.hub.id}`;
+        countsByRoute.set(route, (countsByRoute.get(route) ?? 0) + 1);
     }
-    assert.ok([...countsByDepartureHub.values()].every(count => count <= 5));
+    assert.ok([...countsByRoute.values()].every(count => count <= 5));
+});
+
+test("busy airports keep later flights: Delhi to Mangaluru finds the afternoon direct", async t => {
+    const direct = await prisma.aviationFlightInstance.findFirst({
+        where: {
+            active: true,
+            departureAt: {
+                gte: new Date("2026-11-16T12:00:00+05:30"),
+                lt: new Date("2026-11-17T00:00:00+05:30")
+            },
+            departureAirport: { iataCode: "DEL" },
+            arrivalAirport: { iataCode: "IXE" }
+        }
+    });
+    if (!direct) {
+        t.skip("No afternoon DEL -> IXE flight on 2026-11-16 in this database.");
+        return;
+    }
+    // A 06:00 search used to load only Delhi's first 150 departures (to about
+    // 11:00), so the afternoon direct flight never entered the search.
+    const response = await fetch(`${baseUrl}/api/v1/journeys/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            origin: { latitude: 28.6139, longitude: 77.2090 },
+            destination: { latitude: 12.9141, longitude: 74.8560 },
+            departureAt: "2026-11-16T06:00:00+05:30",
+            options: { journeyTypes: ["FLIGHT_ONLY"], resultOffset: 0, pageSize: 20 }
+        })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.ok(body.data.journeyResults.some(journey => {
+        const flights = journey.legs.filter(leg => leg.mode === "FLIGHT");
+        return flights.length === 1
+            && flights[0].from.code === "DEL"
+            && flights[0].to.code === "IXE";
+    }), "Expected the direct DEL -> IXE flight among the results.");
 });
 
 test("imported flight instances are domestic operating services", async t => {
@@ -606,6 +694,62 @@ test("RAIL_ONLY Haridwar to Kota boards trains at Haridwar and ranks later weekl
             Date.parse(direct[index - 1].finalArrivalAt)
                 <= Date.parse(direct[index].finalArrivalAt)
         );
+    }
+});
+
+test("RAIL_ONLY recommended Dehradun to Chennai starts on the requested day with the full boarding buffer", async t => {
+    const response = await fetch(`${baseUrl}/api/v1/journeys/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            origin: { latitude: 30.3143365, longitude: 78.0335573 },
+            destination: { latitude: 13.0865965, longitude: 80.2745107 },
+            departureAt: "2026-10-28T16:30:00+05:30",
+            options: {
+                journeyTypes: ["RAIL_ONLY"],
+                sortBy: "recommended",
+                resultOffset: 0,
+                pageSize: 20
+            }
+        })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    const results = body.data.journeyResults;
+    if (results.length === 0) {
+        t.skip("No Dehradun -> Chennai railway journeys in this database.");
+        return;
+    }
+    // Every journey keeps the full policy boarding buffer: one that could
+    // only be caught with a shorter wait is not offered at all.
+    const bufferMinutes = body.data.policy.initialRailBufferMinutes;
+    for (const journey of results) {
+        const access = journey.legs[0];
+        const firstTrain = journey.legs.find(leg => leg.mode === "RAIL");
+        assert.equal(access.mode, "LOCAL");
+        assert.ok(
+            Date.parse(firstTrain.departureAt) - Date.parse(access.arrivalAt)
+                >= bufferMinutes * 60_000,
+            `${firstTrain.serviceNumber} from ${firstTrain.from.code} leaves less than ${bufferMinutes} min to board.`
+        );
+    }
+    const penaltyMs = body.data.policy.transferPenaltyMinutes * 60_000;
+    const score = journey => Date.parse(journey.finalArrivalAt)
+        + journey.numberOfTransfers * penaltyMs;
+    for (let index = 1; index < results.length; index += 1) {
+        assert.ok(score(results[index - 1]) <= score(results[index]));
+    }
+    // The Mon/Fri direct service (first one on 30 Oct) must not outrank
+    // connections that leave on 28 Oct and arrive more than a day earlier.
+    assert.ok(Date.parse(results[0].departureAt)
+        < Date.parse("2026-10-29T00:00:00+05:30"));
+    const firstDirect = results.findIndex(
+        journey => journey.numberOfTransfers === 0
+    );
+    if (firstDirect !== -1) {
+        assert.ok(firstDirect > 0);
+        assert.ok(Date.parse(results[0].finalArrivalAt)
+            < Date.parse(results[firstDirect].finalArrivalAt));
     }
 });
 

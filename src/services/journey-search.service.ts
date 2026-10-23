@@ -244,20 +244,19 @@ function buildOption(
         ? sourceDepartureMinute + source.roadTravelMinutes
         : source.stationArrivalMinute;
     // The readiness floor above guarantees sourceDepartureMinute is never
-    // shown before clock.requestedMinute, but says nothing about whether
-    // the traveler can still physically reach THIS station in time for
-    // THIS train once forced that late - road access from a farther
-    // station can eat past the train's own departure, arriving at the
-    // platform after it already left. The provider's own admissibility
-    // bound only checks path.departureMinute >= clock.requestedMinute (a
-    // road-access-blind threshold - see the readyMinute computation this
-    // candidate's source.readyMinute came from), so it does not catch
-    // this. Discarding the candidate here - rather than clamping
-    // BOARDING_WAIT's Math.max(0, ...) to a deceptive 0m - is the only
-    // correct outcome: unlike the readiness floor, arriving late is not a
-    // display choice, it is this candidate genuinely not being reachable
-    // by this traveler from this station for this train.
-    if (flexibleOriginTiming && stationArrivalMinute > path.departureMinute) {
+    // shown before clock.requestedMinute, but once forced that late the
+    // traveler may no longer reach THIS station with the full boarding
+    // buffer (journey_routing_policies.initial_rail_buffer_minutes) before
+    // THIS train leaves. Such a journey is not offered at all, rather than
+    // shown with a squeezed (or 0m) boarding wait. In threshold mode the
+    // provider's admissibility bound (source.readyMinute) already applies
+    // the same rule, but a date-only search admits from minute 0, so this
+    // check remains the guard for it.
+    if (
+        flexibleOriginTiming
+        && stationArrivalMinute + policy.initialRailBufferMinutes
+            > path.departureMinute
+    ) {
         return null;
     }
     const readyMinute = flexibleOriginTiming
@@ -436,10 +435,24 @@ function totalRoadAccessMinutes(option: JourneySearchOption): number {
     return option.sourceAccess.travelMinutes + option.destinationAccess.travelMinutes;
 }
 
+// "recommended" ranks by when the traveller actually arrives, counted from
+// the search (every candidate shares that start, so final arrival alone
+// orders them), plus a policy-configured cost per transfer. A direct train
+// days later no longer outranks a connection arriving far earlier, while a
+// direct train arriving within that cost of a connection still wins.
+function recommendedScoreMs(
+    option: JourneySearchOption,
+    transferPenaltyMinutes: number
+): number {
+    return Date.parse(option.finalArrivalAt)
+        + option.numberOfTransfers * transferPenaltyMinutes * 60_000;
+}
+
 function compareJourneyOptions(
     left: JourneySearchOption,
     right: JourneySearchOption,
-    sortBy: JourneySortOrder = "transfers"
+    sortBy: JourneySortOrder = "transfers",
+    transferPenaltyMinutes = 0
 ): number {
     const tieBreak = left.numberOfTransfers - right.numberOfTransfers
         || Date.parse(left.finalArrivalAt) - Date.parse(right.finalArrivalAt)
@@ -448,6 +461,10 @@ function compareJourneyOptions(
         || left.preTrainWaitingMinutes - right.preTrainWaitingMinutes
         || left.railTransferWaitingMinutes
             - right.railTransferWaitingMinutes;
+    if (sortBy === "recommended") {
+        return recommendedScoreMs(left, transferPenaltyMinutes)
+            - recommendedScoreMs(right, transferPenaltyMinutes) || tieBreak;
+    }
     if (sortBy === "duration") {
         return left.totalJourneyMinutes - right.totalJourneyMinutes || tieBreak;
     }
@@ -732,7 +749,8 @@ type GroupedJourney = {
 
 function groupJourneyOptions(
     options: JourneySearchOption[],
-    sortBy: JourneySortOrder
+    sortBy: JourneySortOrder,
+    transferPenaltyMinutes: number
 ): GroupedJourney[] {
     const grouped = new Map<string, JourneySearchOption[]>();
     for (const option of options) {
@@ -745,7 +763,7 @@ function groupJourneyOptions(
     const results: GroupedJourney[] = [];
     for (const [key, groupOptions] of grouped) {
         groupOptions.sort((left, right) =>
-            compareJourneyOptions(left, right, sortBy)
+            compareJourneyOptions(left, right, sortBy, transferPenaltyMinutes)
         );
         const recommended = groupOptions[0];
         const trains = trainSummaries(recommended);
@@ -829,7 +847,12 @@ function groupJourneyOptions(
         });
     }
     return results.sort((left, right) =>
-        compareJourneyOptions(left.options[0], right.options[0], sortBy)
+        compareJourneyOptions(
+            left.options[0],
+            right.options[0],
+            sortBy,
+            transferPenaltyMinutes
+        )
     );
 }
 
@@ -971,10 +994,15 @@ async function executeCoordinateRailwayJourneySearch(
                 roadTravelMinutes: access.travelMinutes,
                 estimatedRoadDistanceKm: access.estimatedRoadDistanceKm,
                 stationArrivalMinute,
+                // In threshold mode buildOption() discards any train departing
+                // before requested time + road access + boarding buffer, so
+                // admitting those here would only spend the provider's search
+                // budget on candidates that are thrown away later.
                 readyMinute: dateOnlySearch
                     ? 0
                     : departureAtIsTrainThreshold
-                        ? clock.requestedMinute
+                        ? clock.requestedMinute + access.travelMinutes
+                            + policy.initialRailBufferMinutes
                         : stationArrivalMinute + policy.initialRailBufferMinutes
             };
         }
@@ -1024,7 +1052,12 @@ async function executeCoordinateRailwayJourneySearch(
         })
         .filter((option): option is JourneySearchOption => option !== null)
         .sort((left, right) =>
-            compareJourneyOptions(left, right, request.options.sortBy)
+            compareJourneyOptions(
+                left,
+                right,
+                request.options.sortBy,
+                policy.transferPenaltyMinutes
+            )
             || right.boardingStation.activeTrainCount
                 - left.boardingStation.activeTrainCount
         );
@@ -1032,7 +1065,8 @@ async function executeCoordinateRailwayJourneySearch(
         pruneSelfDefeatingFirstLegs(
             pruneUpstreamAlightingDetours(pruneUpstreamBoardingDetours(allOptions))
         ),
-        request.options.sortBy
+        request.options.sortBy,
+        policy.transferPenaltyMinutes
     );
     const selectedGroups = groupedJourneys.slice(
         0,
@@ -1104,7 +1138,7 @@ export async function searchCoordinateRailwayJourney(
                 request.options.resultLimit,
                 JOURNEY_RESULT_LIMIT
             ),
-            sortBy: request.options.sortBy ?? "transfers"
+            sortBy: request.options.sortBy ?? "recommended"
         }
     };
     const cacheKey = createHash("sha256")
@@ -1127,7 +1161,7 @@ export async function searchCoordinateRailwayDeparturesAfter(
                 request.options.resultLimit,
                 JOURNEY_RESULT_LIMIT
             ),
-            sortBy: request.options.sortBy ?? "transfers"
+            sortBy: request.options.sortBy ?? "recommended"
         }
     };
     const cacheKey = createHash("sha256")

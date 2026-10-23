@@ -204,10 +204,16 @@ type FlightInstanceRow = {
     arrivalHubId: bigint;
 };
 
+// The cap is per route (departure airport -> arrival airport), not per
+// departure airport: busy hubs (DEL, BLR, BOM, HYD) schedule hundreds of
+// flights a day, so an earliest-first cap per airport kept only their first
+// few hours and hid every later flight - including the only direct flight to
+// destinations served in the afternoon (e.g. DEL -> IXE at 17:30 was never
+// loaded for a 06:00 search).
 export async function loadFlightInstances(
     start: Date,
     end: Date,
-    maximumPerDepartureAirport = 150
+    maximumPerRoute = 150
 ) {
     const rows = await prisma.$queryRaw<FlightInstanceRow[]>(Prisma.sql`
         SELECT
@@ -222,13 +228,9 @@ export async function loadFlightInstances(
             candidate.arrival_terminal AS "arrivalTerminal",
             candidate.airline_name AS "airlineName",
             candidate.service_type AS "serviceType",
-            departure_airport.hub_id AS "departureHubId",
+            candidate.departure_hub_id AS "departureHubId",
             candidate.arrival_hub_id AS "arrivalHubId"
-        FROM aviation_airports departure_airport
-        JOIN transport_hubs departure_hub
-          ON departure_hub.id = departure_airport.hub_id
-         AND departure_hub.active = TRUE
-        CROSS JOIN LATERAL (
+        FROM (
             SELECT
                 flight.id,
                 flight.identity_key,
@@ -239,25 +241,33 @@ export async function loadFlightInstances(
                 flight.arrival_at,
                 flight.departure_terminal,
                 flight.arrival_terminal,
+                departure_hub.id AS departure_hub_id,
                 arrival_hub.id AS arrival_hub_id,
                 airline.name AS airline_name,
-                airline.service_type
+                airline.service_type,
+                ROW_NUMBER() OVER (
+                    PARTITION BY flight.departure_airport_id, flight.arrival_airport_id
+                    ORDER BY flight.departure_at, flight.id
+                ) AS route_rank
             FROM aviation_flight_instances flight
             JOIN aviation_airlines airline
               ON airline.id = flight.airline_id
              AND airline.service_type = 'scheduled'
+            JOIN aviation_airports departure_airport
+              ON departure_airport.id = flight.departure_airport_id
+            JOIN transport_hubs departure_hub
+              ON departure_hub.id = departure_airport.hub_id
+             AND departure_hub.active = TRUE
             JOIN aviation_airports arrival_airport
               ON arrival_airport.id = flight.arrival_airport_id
             JOIN transport_hubs arrival_hub
               ON arrival_hub.id = arrival_airport.hub_id
              AND arrival_hub.active = TRUE
-            WHERE flight.departure_airport_id = departure_airport.id
-              AND flight.active = TRUE
+            WHERE flight.active = TRUE
               AND flight.departure_at >= ${start}
               AND flight.departure_at <= ${end}
-            ORDER BY flight.departure_at, flight.id
-            LIMIT ${maximumPerDepartureAirport}
         ) candidate
+        WHERE candidate.route_rank <= ${maximumPerRoute}
         ORDER BY candidate.departure_at, candidate.id
     `);
     return rows.map(row => ({

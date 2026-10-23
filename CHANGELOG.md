@@ -22,8 +22,60 @@ not any agent's private memory — is the source of truth for "where are we".
 
 ---
 
-## Current status (updated 2026-10-22)
+## Current status (updated 2026-10-23)
 
+- **Update 2026-10-23 (city coordinates):** migration
+  `20261023140000_fix_city_coordinates` moves Bilaspur, Bareli, Kota and
+  Jabalpur to their main stations and re-maps stations and links.
+  **Applied to the local DB only**; not on the server. Deparizo left as is.
+  Production now needs four new migrations. See the last log entry.
+- **Update 2026-10-23 (airport label):** results page shows airports as
+  "Airport name (CODE)" (e.g. "Dehradun Jolly Grant Airport (DED)"), no
+  repeated city. Frontend only, uncommitted. See the last log entry.
+- **Update 2026-10-23 (airport names):** migration
+  `20261023130000_airport_hub_names` sets 132 airport hub names from the
+  SQLite export (DED "Dehra Dun" → "Dehradun Jolly Grant Airport"; VTZ
+  kept). **Applied to the local DB only**; not on the server. See the last log entry.
+- **Update 2026-10-23 (airport coordinates):** 43 airport hubs are stored at
+  city-centre points (e.g. DED 5 km instead of ~31 km from central Dehradun).
+  Migration `20261023120000_fix_airport_hub_coordinates` is **applied to the
+  local DB only** (server still needs `prisma migrate deploy`; the server
+  also still lacks `20261023090000_recommended_transfer_penalty`). NCR Plaza
+  → DED estimate is now 31.1 km. Open: city rows (Bareli, Bilaspur, Kota,
+  Jabalpur, Deparizo) are also misplaced. See the last log entry.
+- **Update 2026-10-23 (duration sort):** multimodal "Duration" sort now
+  collects 3× the result limit before stopping (`DURATION_SORT_COLLECTION_FACTOR`).
+  Uncommitted. **Note:** the local DB gained 17 Nov flights during this
+  session (5,384 active now; not imported by Claude). See the last log entry.
+- **Update 2026-10-23 (flight cap):** flights are now loaded per route
+  (departure → arrival airport, max 150) instead of per departure airport, so
+  busy airports keep their later flights (DEL → IXE 17:30 now found from a
+  06:00 search). Uncommitted; servers need rebuild + restart. Side effect
+  found: multimodal "Duration" sort can miss a short late trip (see log).
+- **Update 2026-10-23 (later):** train journeys that cannot keep the full
+  `initial_rail_buffer_minutes` boarding wait are no longer offered (the
+  short-lived "Tight connection" warning was removed at the user's request).
+  Uncommitted; servers need rebuild + restart. See the last log entry.
+- **Update 2026-10-23:** new **"Recommended"** sort (`sortBy=recommended`):
+  rank = final arrival + transfers × `journey_routing_policies.transfer_penalty_minutes`
+  (new column, default 240; migration
+  `20261023090000_recommended_transfer_penalty`, applied to the **local DB
+  only**). Added to the dropdown but **not the default** yet (default is still
+  "Number of transfers"). **Update (same day): user reviewed the comparison
+  and made Recommended the default** in the UI and both validators.
+  Uncommitted; server needs `prisma migrate deploy`,
+  `prisma generate`, rebuild + restart.
+- **Update 2026-10-22 (departure-sort fix):** Train only + sort by departure
+  no longer returns 0 for long routes (DDN → MAS: 0 → 14). Changes are in
+  `journey-search.service.ts` (readyMinute includes road access in threshold
+  mode) and `railway-provider.service.ts` (arrival-ordered fallback when the
+  departure search truncates). Uncommitted; tests pass; servers need
+  rebuild + restart. Still ~13 s for that search. See the last log entry.
+- **Update 2026-10-22 (later):** Flight only / Mixed results now start at
+  the real leave-home time (road access + boarding buffer moved to just
+  before the first train/flight; idle pre-boarding wait dropped) in
+  `multimodal-journey.service.ts`. Uncommitted; tsc clean, multimodal tests
+  23/0/2; servers need restart. See the last log entry.
 - **Update 2026-10-22:** commit `68d471b` deployed to the server (Node
   v20.19.6, not to be upgraded). Flight importer switched from `node:sqlite`
   to `sql.js` so it runs there; committed to `main` (not pushed). See the last
@@ -491,3 +543,540 @@ and `CONVERSATION_MEMORY.md` for details.
   `--dry-run`.
 - **Note:** `npm audit` reports 9 pre-existing vulnerabilities (sql.js has
   no dependencies); not addressed.
+
+### 2026-10-22 — Flight/mixed journeys start at the real leave-home time (Claude Code, Opus 5.5)
+
+- **Why:** user reported (Dehradun → Ahmedabad, 2026-11-16 01:00) that
+  Flight only / Mixed cards all showed departure 01:00 (the search time),
+  while Train only showed the real leave-home time (e.g. 14:35). Cause: the
+  multimodal search starts every path's road access at the requested time,
+  then adds the boarding buffer and a `FLIGHT_WAIT`/`RAIL_WAIT` until the
+  first service; `resultFromState` took `departureAt` from that first road
+  leg, so `totalJourneyMinutes` also included hours of idle airport waiting
+  (inflating durations and skewing Fastest / duration ranking and access
+  pruning).
+- **Changed:** `src/services/multimodal-journey.service.ts` — new
+  `alignOriginAccessToFirstBoarding`, applied at the start of
+  `resultFromState`: shifts the origin road leg and `INITIAL_BOARDING_BUFFER`
+  to end at the first RAIL/FLIGHT departure and drops the idle wait before
+  it (waits between later services unchanged). Result `departureAt` and
+  `totalJourneyMinutes` now use the shifted leave-home time, mirroring the
+  railway-only `suggestedLeaveHomeAt`. Search/expansion logic unchanged.
+  Leave-home is still >= the requested time (first boarding is never before
+  requested + access + buffer).
+- **Verification (user-authorized):** `npx tsc --noEmit` clean;
+  `npm run test:multimodal-search` (also runs `npm run build`, so `dist/` is
+  rebuilt) 23 pass / 0 fail / 2 skip (same two data-dependent skips as
+  before). Live Dehradun → Ahmedabad search not re-checked.
+- **Next:** restart the server and re-check that search; commit when the
+  user asks.
+
+### 2026-10-22 — Validation: DDN → MAS, 2026-10-28 16:30, every journey type × sort (Claude Code, Opus 5.5)
+
+- **Why:** user asked to validate this search across all test cases.
+- **No code changed.** Read-only DB queries and direct
+  `searchMultimodalJourneys` calls from scratch scripts (outside the repo);
+  `npm run test:railway-search` 13/13 pass.
+- **Correct (matches timetable):** Train only / transfers, duration,
+  arrival. Direct options are the CDG–MDU SF Exp (runs Mon+Fri only, so the
+  first one from Saharanpur is Fri 30 Oct 10:45); the earliest arrival is
+  12402 DDN 22:45 Wed → NZM, then 12652 → MS, Fri 30 Oct 16:01. Duration and
+  arrival orderings are monotone. No train runs directly from within 60 km of
+  DDN to MAS.
+- **Correct (no data):** Flight only and Mixed return 0. The search horizon
+  is 3 days (to 31 Oct), and the first flights in the DB after 28 Oct are on
+  3 Nov.
+- **Bug found — Train only + sort by departure returns 0 results** after
+  ~12 s with `truncated: true`. For any sort except `transfers`,
+  `railway-provider.service.ts` `executeSearch` skips the direct-path pass
+  and relies only on `searchEarliestPaths`. In departure order, that hits
+  the state limit on this ~40 h route before it completes any path. Same
+  family as the `sortBy=departure` issues in PROJECT_MEMORY. Not fixed yet.
+- **Observations (not bugs / data):** 90999, 20494 and 12688 are all
+  "CDG MDU SF EXP" with near-identical timings (likely duplicate timetable
+  rows). Total result count differs by sort (12 for transfers vs 13 for
+  duration/arrival). Leave-home can be clamped to the requested time, leaving
+  a <30 min boarding wait (12912 at RK, 9 min) — documented intent in
+  `journey-search.service.ts`.
+- **Earlier flight leave-home fix re-checked** on Dehradun → Ahmedabad
+  2026-11-16 01:00: leave times now vary per itinerary (e.g. DED 6E6713
+  leave 14:59, total 4h18, previously 01:00 / ~18h).
+- **Next:** decide on the departure-sort fix (e.g. run the direct-path pass
+  for every sort order, or fall back to the transfers result set and
+  re-sort when the departure search truncates).
+
+### 2026-10-22 — Fix: Train only + sort by departure returned 0 results (Claude Code, Opus 5.5)
+
+- **Why:** user asked to fix the bug found in the DDN → MAS validation above.
+- **Changed:**
+  - `src/services/journey-search.service.ts`: in threshold mode
+    (`departureAtIsTrainThreshold`, used by every RAIL_ONLY search) each
+    origin's `readyMinute` is now requested time + road access instead of
+    requested time alone. This matches `buildOption()`'s existing rejection
+    rule, so only candidates that were already discarded are no longer
+    admitted. Comment in `buildOption()` updated.
+  - `src/services/railway-provider.service.ts` `executeSearch`: when the
+    departure-ordered `searchEarliestPaths` truncates with open slots,
+    run an arrival-ordered pass for those slots. It shares
+    `resultKeys`/`trainKeys`, so nothing is duplicated. `searchComplete`
+    and `truncationReason` reflect the last pass.
+- **Verification (user-authorized):** `npx tsc --noEmit` clean;
+  `test:railway-search` 13/13; `test:multimodal-search` 23 pass / 0 fail /
+  2 skip (same data-dependent skips). DDN → MAS 2026-10-28 16:30 Train
+  only:
+  - departure sort: 0 → 14 results, leave times non-decreasing from 16:30
+  - transfers: 12 → 14; duration and arrival: 13 → 15 (e.g. 12402 from
+    Haridwar, 12470 from Saharanpur were crowded out before)
+  - DWX → SVDK 2026-09-10 07:00 departure sort: 16 results, non-decreasing
+    leave times 07:00 to 13:26
+  - Debug logging was added only to `dist/` and removed by rebuilding.
+- **Still open:** departure sort on long routes takes ~11–14 s (the
+  departure pass still hits the state limit before the fallback). The known
+  backtracking first-leg variants can still appear (SRE → RK, UJN → DWX).
+  Duplicate timetable rows for the CDG–MDU SF Exp (90999/20494/12688) are
+  untouched.
+- **Next:** rebuild + restart servers; commit when the user asks.
+
+### 2026-10-23 — "Recommended" sort with a policy-configured transfer penalty (Claude Code, Opus 5.5)
+
+- **Why:** for DDN → MAS (2026-10-28 16:30), the default "Number of
+  transfers" sort put Mon/Fri direct trains on 30 Oct above connections
+  leaving on 28 Oct and arriving 34 h earlier. The user approved adding a
+  "Recommended" sort as a new option, not the default, with a
+  before/after review before any default switch. They also approved adding
+  the DB column.
+- **Changed:**
+  - `prisma/schema.prisma` and new migration
+    `20261023090000_recommended_transfer_penalty`: adds
+    `journey_routing_policies.transfer_penalty_minutes INT NOT NULL DEFAULT
+    240`, with a CHECK of 0–1440. Applied to the local DB with
+    `prisma migrate deploy`, followed by `prisma generate`.
+  - `src/types/journey-search.ts` and both validators: `"recommended"`
+    added to `JourneySortOrder`. The default is still `"transfers"`.
+  - `src/services/journey-search.service.ts`: `recommendedScoreMs` (final
+    arrival + transfers × penalty), with a branch in `compareJourneyOptions`.
+    The penalty is threaded through `groupJourneyOptions`.
+  - `src/services/railway-provider.service.ts` `executeSearch`:
+    "recommended" runs the direct-train pass without its early return, then
+    an arrival-ordered `searchEarliestPaths` with the full budget.
+  - `src/services/multimodal-journey.service.ts`: `recommendedScoreMinutes`
+    keeps the practicality extras (flight distance, flight-transfer
+    overhead, long layovers, detours) and replaces only the generic 25-min
+    transfer cost with the policy penalty. For rail-only results this equals
+    the railway formula. `policy.transferPenaltyMinutes` is exposed in the
+    response and used when re-sorting cached pages.
+  - `public/journey-results.html`: "Recommended" is the first dropdown
+    option. "Number of transfers" stays `selected` and remains the default
+    in the JS.
+  - `tests/multimodal-search.test.js`: three new tests (validator; ranking
+    unit test where a later direct train loses and a near direct train
+    wins; real DDN → MAS search where the first result leaves on 28 Oct and
+    scores are non-decreasing).
+- **Verification (user-authorized):** `npx tsc --noEmit` clean;
+  `test:railway-search` 13/13; `test:multimodal-search` 26 pass / 0 fail /
+  2 skip. In the app (dev server, Browser pane), DDN → MAS with Sort by
+  Recommended shows option 1 as Wed 28 Oct 22:25 → Fri 30 Oct 16:01, with no
+  console errors.
+- **Before/after (transfers vs recommended, same build):**
+  - DDN → MAS: the 28 Oct connections now come first; the 30 Oct direct
+    trains move down. 14 → 20 results.
+  - HW → KOTA 11-05 15:15: top 3 unchanged (22918 ×2, 12402). The next-day
+    19020 direct is replaced by 1-transfer trips arriving Fri 10:10.
+  - DWX → SVDK and INDB → SVDK: top 3 direct (12919) unchanged. The Sat
+    09321 directs (2 days later) are replaced by 12919 + 22439, arriving 3 h
+    earlier.
+  - NDLS → BPL and CSMT → PUNE: top 5 identical.
+  - NDLS → AGC: same #1. Extra boarding variants appear (20808 from NZM),
+    and a dominated 1-transfer variant (20808 + 13008, arriving 47 min after
+    the same direct train) reaches #6.
+  - HW → LMNR: 1-transfer 19020 + 12416 (Fri 09:33) now ranks above the
+    next-day direct 14318 (Sat 06:05).
+  - Dehradun → Ahmedabad Flight only: the IXC direct (arrives 11:47, 3 h
+    drive) now ranks above the DED direct (arrives 19:17). Mixed: the IXC
+    flight + ADI train first, then some 2-transfer options rank higher.
+  - Speed: recommended is 0.1–1.3 s on these routes. It is slower than
+    transfers where the direct pass used to return early (NDLS → BPL: 19 ms
+    → 491 ms).
+- **Open:** pick the default (needs the user's review of the above). The
+  dominated same-first-train transfer variants (NDLS → AGC #6) could be
+  pruned. Server: back up, `prisma migrate deploy`, `prisma generate`,
+  `npm run build`, restart.
+
+### 2026-10-23 — Recommended is now the default sort (Claude Code, Opus 5.5)
+
+- **Why:** the user reviewed the before/after comparison above and asked
+  for Recommended to be the default in the UI and validators.
+- **Changed:**
+  - `src/validators/journey-search.validator.ts` and
+    `multimodal-journey.validator.ts`: `sortBy` now defaults to
+    `"recommended"`.
+  - `src/services/journey-search.service.ts` and
+    `multimodal-journey.service.ts`: request-level fallbacks
+    (`request.options.sortBy ?? …`) are now `"recommended"`. Internal helper
+    parameter defaults (`compareJourneyOptions`,
+    `selectMultimodalJourneyResults`, `searchRailwayProvider`) stay
+    `"transfers"`; they only apply when a caller passes no sort.
+  - `public/journey-results.html`: Recommended is `selected`.
+    `public/leaflet/journey-results.js`: new `DEFAULT_SORT = "recommended"`
+    is used for the clear-filters reset and both non-default-sort checks.
+  - Tests: the default assertions now expect `"recommended"`. The railway
+    "coordinate search returns ranked nearby-station journeys" test now
+    sends `sortBy: "transfers"` explicitly, because its ordering checks are
+    for the fewest-transfers sort.
+- **Verification:** `npx tsc --noEmit` clean; `test:railway-search` 13/13;
+  `test:multimodal-search` 26 pass / 0 fail / 2 skip. In the app, a fresh
+  page shows Recommended; DDN → MAS (28 Oct 16:30) with no sort change opens
+  on Wed 28 Oct 22:25 → Fri 30 Oct 16:01; changing the sort to Arrival and
+  then "Clear all filters" resets it to Recommended. No console errors from
+  the page (the only 404 is the preview's request for `/`).
+- **Next:** commit when the user asks. Server: back up DB,
+  `npx prisma migrate deploy`, `npx prisma generate`, `npm run build`,
+  restart. API clients that relied on the implicit `"transfers"` default
+  now get `"recommended"` and must send `sortBy: "transfers"` to keep the
+  old order.
+
+### 2026-10-23 — "Tight connection" warning for a squeezed boarding wait (Claude Code, Opus 5.5)
+
+- **Why:** the user asked why the boarding wait differs between options.
+  It is 20 min (`initial_rail_buffer_minutes`) everywhere, except when the
+  leave-home time would fall before the search time. The journey is then
+  kept with less time to board: 12912 at Roorkee gets 9 min for DDN → MAS on
+  28 Oct 16:30. The user chose to keep these journeys and warn about them.
+- **Changed (frontend only, no API change):**
+  - `public/leaflet/journey-results.js`: `receiveResults` stores
+    `policy.initialRailBufferMinutes` / `initialFlightBufferMinutes` from
+    the response. New `tightBoarding(journey)` measures the time from the
+    last road-access arrival to the first RAIL/FLIGHT departure and compares
+    it with that mode's buffer. When it is short, `renderSummary` shows
+    "Tight connection: only X min to board", and `renderTimeline` shows the
+    same note on the boarding-wait row.
+  - `public/leaflet/journey-results.css`: `.tight-boarding` style using the
+    existing `--amber` / `--amber-soft` tokens.
+- **Verification:** `node --check` passes. In the app (the user's own
+  `npm start` server on :3000, which serves `public/` from disk), DDN → MAS
+  28 Oct 16:30 shows the warning only on the 12912-from-Roorkee option, on
+  both the card and the "Boarding wait" row; no console errors. On
+  Dehradun → Ahmedabad 2026-11-16 01:00, Flight only + Mixed (20 results)
+  shows no warnings.
+- **Next:** commit when the user asks.
+
+### 2026-10-23 — Drop journeys with a boarding wait below the policy buffer (Claude Code, Opus 5.5)
+
+- **Why:** the user did not want the "Tight connection: only X min to
+  board" warning. Journeys that can't keep the
+  `journey_routing_policies` boarding buffer should be left out of the
+  results instead.
+- **Changed:**
+  - `public/leaflet/journey-results.js` / `.css`: the warning
+    (`tightBoarding`, `.tight-boarding`, buffer state) is fully removed.
+    The `DEFAULT_SORT` change stays.
+  - `src/services/journey-search.service.ts` `buildOption()`: in flexible
+    timing (threshold or date-only), reject a train when station arrival +
+    `initialRailBufferMinutes` > departure. Before, it was rejected only
+    when station arrival > departure.
+  - Same file, source timings: in threshold mode the provider's
+    `readyMinute` is now requested + road access + boarding buffer, the same
+    bound as above, so the search doesn't spend budget on journeys that
+    will be dropped.
+  - `tests/multimodal-search.test.js`: the DDN → MAS recommended test also
+    asserts that every journey keeps at least the policy boarding buffer.
+- **Verification:** `npx tsc --noEmit` clean; `test:railway-search` 13/13;
+  `test:multimodal-search` 26 pass / 0 fail / 2 skip.
+  - DDN → MAS 28 Oct 16:30: both 12912-from-Roorkee options (9 min) are
+    gone; all 20 results have a 20 min boarding wait.
+  - Scan across 6 routes (DDN → MAS, HW → KOTA, DWX → SVDK, NDLS → AGC,
+    CSMT → PUNE, HW → LMNR) × 5 sorts, Train only: the minimum boarding wait
+    is 20 min everywhere, and no journey leaves before the search time.
+- **Note:** flight/mixed journeys already always keep the full
+  `initial_flight_buffer_minutes` (the leave-home shift added on
+  2026-10-22).
+- **Next:** the user's running `npm start` server on :3000 still runs the
+  old `dist/` loaded at its start and needs a restart (`dist/` is rebuilt).
+  Commit when the user asks.
+
+### 2026-10-23 — Route test matrix (195 searches) (Claude Code, Opus 5.5)
+
+- **Why:** the user asked to test other routes. No code changed. Scratch
+  scripts (outside the repo) call `searchMultimodalJourneys` directly and
+  check every result for:
+  - leg times contiguous; `departureAt`, `finalArrivalAt` and
+    `totalJourneyMinutes` consistent with the legs
+  - no journey leaves before the search time; first service within the
+    horizon
+  - boarding wait >= the policy buffer (rail 20, flight 120)
+  - transfer count = services − 1; journey type matches the filter; no
+    duplicate ids
+  - order is monotone for the chosen sort
+- **Train only:** 18 routes × 5 sorts = 90 searches, **0 failed checks**.
+  Routes: NDLS → AGC, CSMT → PUNE, MAS → SBC, HWH → PNBE, ADI → CSMT,
+  LKO → CNB (23:45), NDLS → TVC, HWH → CSMT, GHY → NDLS, JAT → MAS,
+  ASR → BSB, JU → GKP, MAO → ERS, BBS → VSKP, RNC → CBE, DDN → MAS,
+  HW → KOTA, plus NDLS → BPL date-only. 9–20 results each.
+- **Flight / Mixed / All types:** 7 city routes on 2026-11-16 × 3 types ×
+  5 sorts = 105 searches. Flight only and Mixed: **0 failed checks**.
+  Delhi → Mumbai at 22:00 returns 0 flights; this is correct (last DEL → BOM
+  flight is 23:00, and the DB has no flights after 16 Nov).
+- **Found — "All types" (no `journeyTypes` filter) train journeys still
+  start at the search time:** `executeSearch` in
+  `multimodal-journey.service.ts` uses `searchRailwayOnly`
+  (non-threshold), not `searchRailwayOnlyDeparturesAfter`. So rail-only
+  results there leave at the search time with 87–373 min boarding waits
+  (Dehradun → Ahmedabad 01:00). The long-layover penalty then pushes them
+  down under Recommended. This is not reachable from the UI (its radios
+  always send a filter), only from API clients. Not fixed.
+- **Checker false positive:** the order flags on "All + Recommended" came
+  from the checker ignoring the long-layover penalty. The order is
+  consistent with `recommendedScoreMinutes`.
+- **Latency:** departure sort on long train routes is 9.8–15.4 s, and
+  "All types" + departure is 9.9–18.5 s. Mixed + transfers reaches 5.2 s
+  (HYD → GAU). Everything else is under ~2.5 s.
+- **Next:** decide on the "All types" rail fix; commit when the user asks.
+
+### 2026-10-23 — Flight data count, and the per-airport 150-flight cap (Claude Code, Opus 5.5)
+
+- **Count (local DB, read-only):** 2,846 flight instances, 2,840 active.
+  All 2,840 pass the search's data filters (scheduled airline, active hubs).
+  By date: 16 Nov 2026 = 2,734; 3–7 Nov, 15 Nov and 31 Jan 2027 hold the
+  small DED sets. 779 routes, 3,978 fares, 168 imports. The jump from 2,436
+  (21 Oct) suggests the 2026-10-22 export was imported; there is no log
+  entry for it.
+- **Found — busy airports lose their later flights:** `loadFlightInstances`
+  (`multimodal-routing.repository.ts`) loads at most `maximumPerDepartureAirport`
+  = `FIRST_HOP_MAX_FLIGHTS_TOTAL` (150) flights per departure airport,
+  earliest first, for the whole 3-day window.
+  - From a 06:00 search on 16 Nov, DEL keeps only departures up to 11:05
+    (301 of 451 dropped), BLR up to 15:00, BOM up to 16:00, HYD up to 18:50.
+  - Proof: Delhi → Mangaluru (IXE) has a direct DEL → IXE flight at 17:30.
+    A 12:00 search finds it as #1; a 06:00 search never sees it and shows
+    only a BOM connection. This also limits onward legs from those hubs.
+  - Not fixed; needs the user's OK. Options: cap per (departure airport,
+    arrival airport) instead of per airport, or raise/remove the SQL cap
+    and rely on the in-search per-destination limits.
+
+### 2026-10-23 — Flights loaded per route instead of per departure airport (Claude Code, Opus 5.5)
+
+- **Why:** user asked to fix the 150-flights-per-airport cap found above
+  and re-run the route tests.
+- **Changed:**
+  - `src/repositories/multimodal-routing.repository.ts` `loadFlightInstances`:
+    the per-airport `CROSS JOIN LATERAL … LIMIT` is replaced by
+    `ROW_NUMBER() OVER (PARTITION BY departure_airport_id,
+    arrival_airport_id ORDER BY departure_at, id)` with
+    `route_rank <= maximumPerRoute`. The parameter is renamed from
+    `maximumPerDepartureAirport`. Filters are unchanged.
+  - `src/services/multimodal-journey.service.ts`: new
+    `MAX_FLIGHTS_LOADED_PER_ROUTE = 150`, passed instead of the unrelated
+    `FIRST_HOP_MAX_FLIGHTS_TOTAL`.
+  - `tests/multimodal-search.test.js`: the SQL-limit test now checks
+    per-route counts and uses 2026-11-16, so it runs instead of skipping.
+    New test: Delhi → Mangaluru at 06:00 must include the direct DEL → IXE
+    flight.
+- **Verification:**
+  - `npx tsc --noEmit` clean; `test:railway-search` 13/13;
+    `test:multimodal-search` 28 pass / 0 fail / 1 skip (was 2 skips).
+  - Delhi → IXE at 06:00: 7 → 20 results, #1 is now the 17:30 direct.
+    Delhi → HGI at 06:00: 0 → 1 (12:00 direct).
+  - Window load for 16 Nov 06:00 + 3 days: 2,558 flights in 32 ms.
+  - The in-search first-hop limit (3 per destination, 150 total) picks every
+    destination at DEL/BLR/BOM/HYD (DEL uses 145 slots), so it does not cut
+    late flights.
+  - Route matrix re-run: train-only 90 searches identical, 0 issues.
+    Flight/mixed/all: 105 searches; 15 changed and 1 known checker false
+    positive (All + Recommended, long-layover penalty).
+  - Improvements: BLR → CCU departure arrives 20:54 instead of 00:04+1;
+    MAA → JAI 21:51 instead of 02:21+1; HYD → GAU 9 → 11 results;
+    COK → LKO departure now 1 transfer arriving 13:39 instead of
+    2 transfers arriving 19:49.
+  - Latency: median 389 ms, max 17.4 s (All + departure), essentially
+    unchanged.
+- **Side effect found (not fixed):** the multimodal search stops at
+  `resultLimit` matching journeys, in arrival-priority order, and only then
+  sorts. With more early flights loaded, Dehradun → Ahmedabad Mixed sorted
+  by Duration no longer includes 6E6713 DED 14:59 + 20987 (arrives 21:45,
+  6 h 46 m, previously #1). #1 is now 6E6395 IXC + 19036 (10 h 01 m).
+  Recommended is unaffected in practice, because that trip arrives later
+  than the 14:23 options. The fix would be to keep exploring past
+  `resultLimit` for `duration` (or use a duration-aware stop rule).
+- **Next:** decide on the Duration-sort stop rule; commit when the user
+  asks.
+
+### 2026-10-23 — Multimodal Duration sort explores past the result limit (Claude Code, Opus 5.5)
+
+- **Why:** the user asked to make the multimodal "Duration" sort keep
+  exploring past the result limit so the shortest journeys are found, then
+  re-run the route tests.
+- **Changed:** `src/services/multimodal-journey.service.ts`: new
+  `DURATION_SORT_COLLECTION_FACTOR = 3`. When `sortBy === "duration"`, the
+  search loop collects up to `resultLimit × 3` matching journeys
+  (`collectionLimit`) before stopping. It is still bounded by
+  `MULTIMODAL_MAX_EXPANDED_STATES` (15,000) and the horizon. The final sort
+  keeps the shortest `resultLimit`. Other sorts are unchanged.
+- **How 3 was chosen** (6 city pairs, Flight only + Mixed, Duration sort,
+  16 Nov):
+
+  | Factor | Effect |
+  |---|---|
+  | 1 (old) | baseline |
+  | 3 | 20th-shortest: DEL → BOM flight 18h00 → 11h35, HYD → GAU 29h24 → 24h19, BLR → CCU 17h36 → 14h51. MAA → JAI Mixed shortest 11h45 → 8h32. Max 2.0 s, never truncated. |
+  | 5 | little extra gain; DEL → BOM Mixed hits the 15k-state budget |
+  | unlimited | every route hits 15k states; up to 29 s (BLR → CCU Flight only) |
+
+  Re-measured after the new data import: identical numbers.
+- **The 6h46m Dehradun → Ahmedabad "Mixed" trip is still missing from a
+  01:00 Duration search, even with unlimited exploration** (budget runs out
+  first). It is 6E6713 DED → AMD, then road to Sabarmati, then local train
+  20987 SDGM → Asarva within Ahmedabad. The same flight alone arrives at
+  19:17 (4h18m door to door), so the train only adds ~2.5 h. It is still
+  found under Transfers, and under Duration from a 12:00 search. Not chased
+  further.
+- **Data changed during the session (not by Claude):**
+  `data/flight-exports/flights-2026-11-16.sqlite` and
+  `flights-2026-11-17.sqlite` (15:04–15:05) were imported. The DB now has
+  5,390 flights (5,384 active): 16 Nov 2,768, 17 Nov 2,510.
+- **Verification:** `npx tsc --noEmit` clean; `test:railway-search` 13/13;
+  `test:multimodal-search` 28 pass / 0 fail / 1 skip. Route matrix
+  (195 searches): **0 failed checks** (the earlier All + Recommended checker
+  false positive no longer triggers). Train-only 90: identical. Flight /
+  Mixed / All: 29 changed, mixing the new 17 Nov data (DEL → BOM at 22:00:
+  0 → 20 flight results, #1 now 17 Nov 00:52 → 06:02; HYD → GAU 11 → 20) and
+  the Duration change (MAA → JAI Mixed #1 8h32 instead of 11h45; COK → LKO
+  All #1 13:39 instead of 15:14). Latency median 522 ms, max 16.2 s (All +
+  departure).
+- **Next:** commit when the user asks; restart servers.
+
+### 2026-10-23 — Airport hub coordinates fix (migration written, not applied) (Claude Code, Opus 5.5)
+
+- **Request:** NCR Plaza (Dehradun) → DED, Flight only, showed "Est. 5.0 km
+  by road"; the real airport is ~31 km by the same estimate.
+- **Root cause:** the DED hub in `transport_hubs` is stored at Dehradun city
+  centre (30.3166680, 78.0333300), not Jolly Grant (30.1892430, 78.1766510).
+  Airport hubs created by the old Aviation Edge importer often hold
+  city-centre points (round arc-minute values). The SQLite migration and
+  `addMissingAirports` in `import-flight-sqlite.ts` skip existing airports,
+  so they never correct them. `refreshGeographyAndTransfers` only fills a
+  NULL `geom` and never re-maps airport cities, so a link refresh alone does
+  not fix it.
+- **Check (user ran a read-only comparison against the SQLite migration
+  coordinates):** 62 airports > 1 km off. Agreed with the user: fix 43
+  (mostly city-centre points; PAB and BEK even point at the wrong city
+  entirely), keep 17 precise points 1–1.6 km apart (AMD, RJI, JDH, BDQ, CCU,
+  COK, IDR, KQH, IXZ, TEZ, TRZ, JAI, BOM, IXE, JRH, MAA, IXI), keep VTZ
+  (SQLite point is the new Bhogapuram airport; unconfirmed that flights moved)
+  and SXR (2 km, both precise).
+- **Added:** `prisma/migrations/20261023120000_fix_airport_hub_coordinates/migration.sql`
+  (one transaction): backs up affected rows to
+  `maintenance_backups.airport_hub_coordinates_20261023` (outside `public`,
+  so Prisma sees no drift; restore SQL in the file comment), moves the 43
+  hubs (`latitude`, `longitude`, `geom`), re-maps the city only when it is
+  missing or now > 60 km away, then retires and rebuilds those hubs'
+  transfer links with the `linkAirportHubs` rules (100 km max). Skips hubs
+  already within 1 km, so it is safe to re-run.
+- **Not run:** migration not applied anywhere; no code changed. KQH and IXX
+  have no linked city (so no transfer links); IXX gets one from this
+  migration, KQH does not (its point was kept).
+- **Next:** user reviews the migration → apply locally (`prisma migrate
+  deploy`), re-run the check query (expect only the 19 kept airports), re-run
+  NCR Plaza → DED (expect ~31 km), run the three test commands, then apply on
+  the server. Open decision: importer should warn (recommended) or
+  auto-correct when an existing airport is > 1 km from the export point.
+- **Applied locally (same day, user-authorized):** `prisma migrate deploy`
+  on the local DB (`localhost:5432/afg_geodata`; only this migration was
+  pending). 43 rows backed up. Re-run check query: only the 19 kept airports
+  remain. NCR Plaza → DED (Flight only, 16 Nov 06:00): estimated road access
+  to DED is now 31.1 km (20.7 km aerial); it was 4.3 km with the same
+  approximate origin. `npx tsc --noEmit` clean; `test:railway-search` 13/13;
+  `test:multimodal-search` 28 pass / 0 fail / 1 skip.
+- **New finding:** `transport_cities` rows from Aviation Edge are also
+  misplaced: Bareli (26.2167, 81.2333 = Rae Bareli), Bilaspur (31.3167,
+  76.8333 = Himachal), Kota (25.0, 76.5), Jabalpur (22.6667, 79.925),
+  Deparizo. With no other city within 60 km, BEK, PAB and DEP kept their
+  city and now have **0 transfer links** (their old 51/18/6 links pointed at
+  stations in the wrong region). Impact is small: BEK 1 and PAB 1 active
+  flight, DEP 0. KTU and JLR keep links (27/44). IXX still has no city.
+- **Next:** decide whether to fix those city coordinates (then re-map airport
+  cities and rebuild links); apply both pending migrations on the server and
+  rebuild + restart; importer warn-vs-auto-correct decision still open.
+
+### 2026-10-23 — Airport hub names from the SQLite export (migration written, not applied) (Claude Code, Opus 5.5)
+
+- **Request:** airport results should show the airport name ("Dehradun Jolly
+  Grant Airport"), not "Dehra Dun". The results page label is
+  `name city (code)` from `transport_hubs.name` (`placeLabel` in
+  `public/leaflet/journey-results.js`), so DED showed "Dehra Dun Dehra Dun (DED)".
+- **Cause:** same as the coordinates: names come from the old Aviation Edge
+  import (often a city or old locality: LKO "Amausi", PNQ "Lohegaon", TRZ and
+  RAJ "Civil"), and the SQLite migration/importer never update existing
+  airports. Read-only check: 133 of 165 airports differ from the export.
+- **City check (read-only, same day):** `transport_cities` points to fix:
+  Bilaspur (Himachal instead of Chhattisgarh), Bareli (Rae Bareli instead of
+  Bareilly), Kota, Jabalpur. Keep 8 name-match false alarms. Deparizo acts as
+  Itanagar (HGI + Naharlagun stations); undecided. No city migration yet.
+- **Added:** `prisma/migrations/20261023130000_airport_hub_names/migration.sql`
+  (one transaction): lists 164 export names (all except VTZ), backs up the
+  rows it will change to `maintenance_backups.airport_hub_names_20261023`,
+  then updates only names that differ (132 locally). Re-running does nothing.
+- **Not run; no code changed.** After it is applied the label reads
+  "Dehradun Jolly Grant Airport Dehra Dun (DED)"; dropping the repeated city
+  from `placeLabel` is a separate, not-yet-requested code change.
+- **Next:** user review → apply locally; decide on the city-fix migration and
+  the label change; apply pending migrations on the server.
+- **Applied locally (same day, user-authorized):** `prisma migrate deploy`
+  on `localhost:5432/afg_geodata` (only this migration pending). 132 names
+  backed up; the name check now returns only VTZ. NCR Plaza → DED search
+  (Flight only, 16 Nov 06:00, fresh process on a spare port): flight legs show
+  "Dehradun Jolly Grant Airport", "Indira Gandhi International Airport",
+  "Pune International Airport". The dev server on :3000 was not restarted.
+
+### 2026-10-23 — Airport label without the repeated city (Claude Code, Opus 5.5)
+
+- **Request:** "Dehradun Jolly Grant Airport Dehra Dun (DED)" should not
+  repeat the city.
+- **Changed:** `public/leaflet/journey-results.js` `placeLabel`: airports
+  now render as `name (CODE)`; the city is no longer appended. Stations are
+  unchanged. It is the only place that builds airport labels.
+- **Verified in the browser** on the running :3000 server (it serves
+  `public/` from disk; its backend is still the old build, but the names come
+  from the already-updated local DB): DDN → CSMT, Flight only, 16 Nov 06:00,
+  option 1 details show "Dehradun Jolly Grant Airport (DED) → Chhatrapati
+  Shivaji Maharaj International Airport (BOM)" and "Est. 29 km by road" from
+  Dehradun station to DED. A preview on :3001 could not be used because
+  `API_URL` in `.env` points the page at :3000.
+- **Next:** commit when the user asks; city fix deferred by the user (2026-10-23);
+  production needs the three new migrations plus rebuild + restart.
+
+### 2026-10-23 — City coordinates fix (migration written, not applied) (Claude Code, Opus 5.5)
+
+- **Request:** write the city-fix migration (user had deferred it, then
+  asked for it).
+- **Added:** `prisma/migrations/20261023140000_fix_city_coordinates/migration.sql`
+  (one transaction). Moves PAB Bilaspur → BSP (22.0561021, 82.1707668),
+  BEK Bareli → BE (28.3381037, 79.4102663), KTU Kota → KOTA (25.2239827,
+  75.8808529), JLR Jabalpur → JBP (23.1649573, 79.9512511). Backs up city
+  rows (`maintenance_backups.city_coordinates_20261023`) and every changed
+  hub city (`maintenance_backups.hub_cities_20261023`). Re-maps stations near
+  the old/new points or in these cities to the nearest city within 60 km, and
+  clears the city when none is in range (the existing refresh keeps stale
+  cities). Airports keep/choose their `city_iata_code` city. Rebuilds links
+  for all hubs in these cities and every re-mapped hub; ranks are computed
+  over whole cities so the airport 10-station cap still holds.
+- **Read-only preview (local DB):** no airport changes city. Stations: 49
+  Bareilly-area (incl. BE, BRY) none → Bareli and 13 Pantnagar → Bareli;
+  33 Rae Bareli-area (incl. RBL) Bareli → none, 5 → Lucknow, 2 → Kanpur,
+  1 → Allahabad; 27 Chhattisgarh (incl. BSP) none → Bilaspur, 6 Himachal
+  Bilaspur → none, 2 → Chandigarh, 1 → Simla; 25 (incl. KOTA) none → Kota,
+  6 Kota → none, 1 → Guna; 6 none → Jabalpur, 24 Jabalpur → none.
+- **Not run; no code changed.** Deparizo (acts as Itanagar) unchanged.
+- **Next:** user review → apply locally, then check BEK/PAB links and a
+  Bareilly/Bilaspur search; production needs all four new migrations.
+- **Applied locally (same day, user-authorized):** `prisma migrate deploy`
+  on `localhost:5432/afg_geodata` (only this migration pending). Backups: 4
+  cities, 201 hub cities (matches the preview exactly). Active transfer links
+  6,607 → 6,706. Airports now: BEK 72 links (nearest DOX, IZN, BRY; city
+  10.1 km), PAB 37 (CHBT, DPH, BYL, BSP; 9.7 km), KTU 46 (incl. KOTA;
+  7.9 km), JLR 32 (incl. JBP; 10.4 km). Search Connaught Place → Bilaspur Jn
+  (Flight only + Flight → Train, 16 Nov 04:00): DEL → PAB flight, then
+  14.6 km estimated road to Bilaspur Jn. `npx tsc --noEmit` clean;
+  `test:railway-search` 13/13; `test:multimodal-search` 28 pass / 0 fail /
+  1 skip.
+- **Next:** commit when the user asks; production needs `prisma migrate
+  deploy` (4 migrations) + rebuild + restart; restart the :3000 dev server.

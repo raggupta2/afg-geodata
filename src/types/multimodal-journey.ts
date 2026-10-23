@@ -90,6 +90,7 @@ export type MultimodalSearchResult = {
         sameAirportFlightTransferMinutes: number;
         maximumTransfers: number;
         searchHorizonDays: number;
+        transferPenaltyMinutes: number;
     };
     coverage: {
         status: "COMPLETE" | "PARTIAL" | "RAIL_ONLY";

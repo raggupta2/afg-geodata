@@ -52,8 +52,8 @@ const options = z.object({
     pageSize: z.number().int().min(1).max(20).optional(),
     resultLimit: z.number().int().min(1).max(50)
         .default(JOURNEY_RESULT_LIMIT),
-    sortBy: z.enum(["transfers", "duration", "departure", "arrival"])
-        .default("transfers")
+    sortBy: z.enum(["recommended", "transfers", "duration", "departure", "arrival"])
+        .default("recommended")
 }).strict().transform(value => ({
     ...value,
     resultOffset: value.resultOffset === undefined
