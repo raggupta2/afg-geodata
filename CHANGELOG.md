@@ -22,8 +22,11 @@ not any agent's private memory — is the source of truth for "where are we".
 
 ---
 
-## Current status (updated 2026-10-24)
+## Current status (updated 2026-10-26)
 
+- **Update 2026-10-26 (search spinner):** station/address inputs show an
+  in-input spinner while their API call runs (journey-results and
+  train-schedule). Uncommitted; see the last log entry.
 - **Update 2026-10-24 (Mixed search + station data):** multimodal search
   for recommended/arrival sorts no longer stops at the first 20 matches,
   and origin hubs are expanded first. Mixed now finds train→flight trips
@@ -1183,3 +1186,29 @@ and `CONVERSATION_MEMORY.md` for details.
   station on purpose (`itineraryKey`); `convertRailwayResult` drops both
   lists, and the page never shows them.
 - **No code changed.** Design given in chat; next is the user's go-ahead.
+
+### 2026-10-26 — Spinner for station/address lookups (Claude Code, Opus 5.5)
+
+- **Request:** show a loader while station search and its API calls run;
+  options first. User picked "spinner in input" for station autocomplete,
+  address autocomplete and the address-details lookup.
+- **Changed:** `public/leaflet/journey-results.{js,css}` — new
+  `setInputLoading()` toggles `.is-searching` (CSS `::after` spinner,
+  `aria-busy`) on the input wrapper; only the latest request clears it.
+  Covers `railways/stations`, `places/autocomplete`, `places/details`.
+  `public/train-schedule.html` + `public/leaflet/train-schedule.js` — station
+  inputs wrapped in `.input-wrap` (no visual change) so the spinner sits
+  inside the input; per-field request sequence owns the spinner.
+- **Verified:** CSS checked in a static preview (train-schedule spinner
+  renders inside the input). Not run against the server (edit-only mode).
+- **Next:** reload the pages on a running server and type in a station field;
+  commit when asked. Front-end only, no rebuild needed (static files).
+- **Same day (spinner not visible on journey page):** user saw no spinner on
+  the From/To station inputs. Cause: `railways/stations` answers in ~14 ms,
+  so the spinner flashed for one frame. Now the spinner starts on the first
+  keystroke (covering the 250/300 ms debounce), stays up at least
+  `MIN_LOADING_VISIBLE_MS` (300 ms), and a new keystroke aborts the
+  in-flight lookup so it can't hide the spinner early. Same timing applied to
+  train-schedule. Verified on the running localhost:3000 server (static
+  files): station spinner visible ~300 ms, address ~650 ms, suggestions
+  still render.

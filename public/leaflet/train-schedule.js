@@ -28,15 +28,21 @@ function setupStationAutocomplete(prefix) {
 
     input.addEventListener("input", () => {
         clearTimeout(timer);
+        // A new keystroke supersedes any in-flight lookup's spinner.
+        const sequence = ++stationRequestSequence[prefix];
         document.getElementById(`${prefix}Latitude`).value = "";
         document.getElementById(`${prefix}Longitude`).value = "";
         const query = input.value.trim();
         if (query.length < 2) {
+            input.parentElement.classList.remove("is-searching");
             hideSuggestions(suggestions);
             return;
         }
+        // Show the spinner from the first keystroke, not after the debounce.
+        stationSearchStartedAt[prefix] = Date.now();
+        input.parentElement.classList.add("is-searching");
         timer = setTimeout(
-            () => loadStationSuggestions(prefix, query),
+            () => loadStationSuggestions(prefix, query, sequence),
             250
         );
     });
@@ -45,8 +51,15 @@ function setupStationAutocomplete(prefix) {
     );
 }
 
-async function loadStationSuggestions(prefix, query) {
+const stationRequestSequence = { origin: 0, destination: 0 };
+const stationSearchStartedAt = { origin: 0, destination: 0 };
+// Station lookups often answer in a few milliseconds; keep the spinner
+// visible this long so it doesn't just flash.
+const MIN_SPINNER_VISIBLE_MS = 300;
+
+async function loadStationSuggestions(prefix, query, sequence) {
     const suggestions = document.getElementById(`${prefix}Suggestions`);
+    const inputWrap = document.getElementById(`${prefix}Label`).parentElement;
     try {
         const response = await fetch(
             getApiUrl(
@@ -63,6 +76,15 @@ async function loadStationSuggestions(prefix, query) {
         );
     } catch {
         hideSuggestions(suggestions);
+    } finally {
+        // Only the latest request owns the spinner.
+        const remaining = MIN_SPINNER_VISIBLE_MS
+            - (Date.now() - stationSearchStartedAt[prefix]);
+        setTimeout(() => {
+            if (sequence === stationRequestSequence[prefix]) {
+                inputWrap.classList.remove("is-searching");
+            }
+        }, Math.max(0, remaining));
     }
 }
 

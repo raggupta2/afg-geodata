@@ -272,6 +272,27 @@
             display: inline-block;
         }
 
+        /* Shown while a station lookup is in flight. */
+        .autocomplete .input-wrap {
+            position: relative;
+            display: inline-block;
+        }
+
+        .input-wrap.is-searching::after {
+            content: "";
+            position: absolute;
+            top: 50%;
+            right: 15px;
+            width: 14px;
+            height: 14px;
+            margin-top: -9px;
+            border: 2px solid #ddd;
+            border-top-color: #0066cc;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            pointer-events: none;
+        }
+
         .suggestions {
             position: absolute;
             top: 100%;
@@ -327,8 +348,10 @@
         <div class="search-field">
             <label for="originLabel">Current location or station</label>
             <div class="autocomplete">
-                <input id="originLabel" type="text"
-                    placeholder="Search DEHRADUN or DDN" autocomplete="off">
+                <span class="input-wrap">
+                    <input id="originLabel" type="text"
+                        placeholder="Search DEHRADUN or DDN" autocomplete="off">
+                </span>
                 <ul id="originSuggestions" class="suggestions"></ul>
             </div>
             <div class="coordinate-row">
@@ -343,8 +366,10 @@
         <div class="search-field">
             <label for="destinationLabel">Destination station or city</label>
             <div class="autocomplete">
-                <input id="destinationLabel" type="text"
-                    placeholder="Search NEW DELHI or NDLS" autocomplete="off">
+                <span class="input-wrap">
+                    <input id="destinationLabel" type="text"
+                        placeholder="Search NEW DELHI or NDLS" autocomplete="off">
+                </span>
                 <ul id="destinationSuggestions" class="suggestions"></ul>
             </div>
             <div class="coordinate-row">

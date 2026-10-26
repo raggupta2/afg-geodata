@@ -130,26 +130,36 @@ function setupAutocomplete(prefix) {
 
     input.addEventListener("input", () => {
         clearTimeout(timer);
+        // A new keystroke supersedes any in-flight lookup, so its finally
+        // block can't hide the spinner while the next debounce is pending.
+        queryController?.abort();
+        queryController = null;
         clearCoordinates(prefix);
         activeIndex = -1;
         const query = input.value.trim();
         if (query.length < 2) {
+            setInputLoading(input, false, { immediate: true });
             closeSuggestions(input, list);
             return;
         }
+        // Show the spinner from the first keystroke, not after the debounce.
+        setInputLoading(input, true);
         timer = setTimeout(async () => {
-            queryController?.abort();
-            queryController = new AbortController();
+            const controller = queryController = new AbortController();
             try {
                 const response = await fetch(
                     apiUrl(`railways/stations?q=${encodeURIComponent(query)}&limit=5`),
-                    { signal: queryController.signal }
+                    { signal: controller.signal }
                 );
                 const body = await response.json();
                 if (!response.ok || !body.success) throw new Error();
                 renderSuggestions(prefix, body.data?.features || []);
             } catch (error) {
                 if (error.name !== "AbortError") closeSuggestions(input, list);
+            } finally {
+                // Only the latest request owns the spinner; an aborted one
+                // must not hide it while its replacement is still loading.
+                if (queryController === controller) setInputLoading(input, false);
             }
         }, 250);
     });
@@ -219,6 +229,31 @@ function selectStation(prefix, feature) {
     closeSuggestions(
         elements[`${prefix}Label`], elements[`${prefix}Suggestions`]
     );
+}
+
+const inputLoadingStartedAt = new WeakMap();
+const inputLoadingHideTimers = new WeakMap();
+
+// Station lookups often answer in a few milliseconds, so keep the spinner up
+// for MIN_LOADING_VISIBLE_MS or it would never be seen.
+function setInputLoading(input, loading, { immediate = false } = {}) {
+    const wrapper = input.parentElement;
+    clearTimeout(inputLoadingHideTimers.get(input));
+    const apply = value => {
+        wrapper.classList.toggle("is-searching", value);
+        input.setAttribute("aria-busy", String(value));
+    };
+    if (loading) {
+        if (!wrapper.classList.contains("is-searching")) {
+            inputLoadingStartedAt.set(input, Date.now());
+        }
+        apply(true);
+        return;
+    }
+    const remaining = MIN_LOADING_VISIBLE_MS
+        - (Date.now() - (inputLoadingStartedAt.get(input) ?? 0));
+    if (immediate || remaining <= 0) apply(false);
+    else inputLoadingHideTimers.set(input, setTimeout(() => apply(false), remaining));
 }
 
 function closeSuggestions(input, list) {
@@ -298,16 +333,18 @@ function setupAddressAutocomplete(target) {
 
     input.addEventListener("input", () => {
         clearTimeout(timer);
+        suggestionController?.abort();
+        requestSequence++;
         clearCoordinates(target);
         activeIndex = -1;
         const query = input.value.trim();
         if (query.length < 2) {
-            suggestionController?.abort();
+            setInputLoading(input, false, { immediate: true });
             closeSuggestions(input, list);
             return;
         }
+        setInputLoading(input, true);
         timer = setTimeout(async () => {
-            suggestionController?.abort();
             suggestionController = new AbortController();
             const sequence = ++requestSequence;
             try {
@@ -326,6 +363,8 @@ function setupAddressAutocomplete(target) {
                 renderAddressSuggestions(target, body.data || []);
             } catch (error) {
                 if (error.name !== "AbortError") closeSuggestions(input, list);
+            } finally {
+                if (sequence === requestSequence) setInputLoading(input, false);
             }
         }, 300);
     });
@@ -391,6 +430,7 @@ async function selectAddress(target, suggestion) {
     const list = elements[`${prefix}Suggestions`];
     closeSuggestions(input, list);
     input.value = suggestion.description;
+    setInputLoading(input, true);
 
     try {
         const response = await fetch(apiUrl(
@@ -409,6 +449,8 @@ async function selectAddress(target, suggestion) {
         state.addressSessionTokens[target] = null;
     } catch {
         showFormError("Couldn't load the selected address. Please try again.");
+    } finally {
+        setInputLoading(input, false);
     }
 }
 
