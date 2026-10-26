@@ -72,11 +72,35 @@ type SearchState = {
 class StateQueue {
     private readonly values: SearchState[] = [];
 
-    constructor(private readonly sortBy: JourneySortOrder) {}
+    constructor(
+        private readonly sortBy: JourneySortOrder,
+        private readonly transferPenaltyMs = 0
+    ) {}
 
     get length(): number { return this.values.length; }
 
+    // The recommended score charges every transfer; ordering the queue the
+    // same way pops few-transfer states first instead of letting cheap
+    // fly-then-several-trains branches use up the budget.
+    private recommendedPriority(state: SearchState): number {
+        return state.priority
+            + Math.max(0, state.scheduledLegs - 1) * this.transferPenaltyMs;
+    }
+
     private compare(left: SearchState, right: SearchState): number {
+        // Origin hubs (no service boarded yet) always go first, as they
+        // already do under the transfers and departure orders. Otherwise the
+        // weighted heuristic makes a seed airport ~2,000 km from the
+        // destination look a day away, and trains already heading that way
+        // keep it from ever being expanded - its direct flight was never
+        // found when trains were allowed (e.g. Dehradun -> Chennai via IXC).
+        const leftIsOrigin = left.scheduledLegs === 0;
+        if (leftIsOrigin !== (right.scheduledLegs === 0)) {
+            return leftIsOrigin ? -1 : 1;
+        }
+        if (this.sortBy === "recommended") {
+            return this.recommendedPriority(left) - this.recommendedPriority(right);
+        }
         if (this.sortBy === "transfers") {
             return left.scheduledLegs - right.scheduledLegs
                 || left.priority - right.priority;
@@ -273,6 +297,64 @@ function remainingTimeHeuristicMs(
 ): number {
     const distanceKm = haversineKm(fromLatitude, fromLongitude, toLatitude, toLongitude);
     return (distanceKm / FASTEST_MODE_SPEED_KPH) * 60 * 60 * 1000 * HEURISTIC_WEIGHT;
+}
+
+// Because of HEURISTIC_WEIGHT the queue does not pop completions in score
+// order, so "stop at the first resultLimit matches" kept whatever it met
+// first: for Mixed searches mostly cheap flight-then-train trips, while a
+// better train-then-flight trip (which needs a feeder train first) was never
+// reached. For these sorts the search instead keeps going and drops any state
+// that cannot beat the current resultLimit-th best (branch and bound).
+const BOUNDED_SEARCH_SORTS: ReadonlySet<JourneySortOrder> = new Set([
+    "recommended",
+    "arrival"
+]);
+// Once resultLimit results are kept, how many more states the bounded search
+// may expand looking for better ones. Not a "truncated" stop: the results are
+// complete, only possibly not the best that a longer search would find.
+const BOUNDED_SEARCH_EXTRA_EXPANSIONS = Number(
+    process.env.MULTIMODAL_BOUNDED_EXTRA_EXPANSIONS ?? 2_000
+);
+
+// Lower bound, in minutes, on the sort score of any journey completed from
+// this state. Measured from the last train/flight arrival: everything after it
+// (more services, transfers, the final road leg) moves no faster than
+// FASTEST_MODE_SPEED_KPH in a straight line, and a trailing transfer can be
+// dropped at completion (see resultFromState), so state.arrivalMs is not used.
+// Transfers only grow, and the flight extras already earned (flight distance,
+// flight-to-flight changes) stay in the recommended score; the remaining
+// extras are never negative and are left out.
+function completionLowerBoundMinutes(
+    state: SearchState,
+    request: MultimodalSearchInput,
+    sortBy: JourneySortOrder,
+    transferPenaltyMinutes: number
+): number {
+    let lastScheduled: MultimodalLeg | undefined;
+    let flightKm = 0;
+    let flights = 0;
+    for (let index = state.legs.length - 1; index >= 0; index -= 1) {
+        const leg = state.legs[index];
+        if (!lastScheduled && (leg.mode === "RAIL" || leg.mode === "FLIGHT")) {
+            lastScheduled = leg;
+        }
+        if (leg.mode === "FLIGHT") {
+            flightKm += leg.distanceKm ?? 0;
+            flights += 1;
+        }
+    }
+    if (!lastScheduled) return Number.NEGATIVE_INFINITY;
+    const remainingKm = haversineKm(
+        lastScheduled.to.latitude, lastScheduled.to.longitude,
+        request.destination.latitude, request.destination.longitude
+    );
+    const arrivalMinutes = Date.parse(lastScheduled.arrivalAt) / 60_000
+        + (remainingKm / FASTEST_MODE_SPEED_KPH) * 60;
+    if (sortBy !== "recommended") return arrivalMinutes;
+    return arrivalMinutes
+        + Math.max(0, state.scheduledLegs - 1) * transferPenaltyMinutes
+        + flightKm * FLIGHT_DISTANCE_MINUTES_PER_KM
+        + Math.max(0, flights - 1) * FLIGHT_TRANSFER_PENALTY_MINUTES;
 }
 
 const resultCache = new BoundedAsyncTtlCache<CachedMultimodalSearchResult>(
@@ -786,6 +868,17 @@ function recommendedScoreMinutes(
         + practicalityExtras;
 }
 
+// The score compared against completionLowerBoundMinutes().
+function boundedSortScoreMinutes(
+    result: MultimodalJourneyResult,
+    sortBy: JourneySortOrder,
+    transferPenaltyMinutes: number
+): number {
+    return sortBy === "recommended"
+        ? recommendedScoreMinutes(result, transferPenaltyMinutes)
+        : Date.parse(result.finalArrivalAt) / 60_000;
+}
+
 function compareMultimodalResultsBy(
     left: MultimodalJourneyResult,
     right: MultimodalJourneyResult,
@@ -997,7 +1090,10 @@ async function executeSearch(
             .filter((hub): hub is RoutingHub => hub?.type === "AIRPORT")
             .map(hub => hub.id)
     );
-    const queue = new StateQueue(request.options.sortBy);
+    const queue = new StateQueue(
+        request.options.sortBy,
+        policy.transferPenaltyMinutes * 60_000
+    );
     const best = new Map<string, number>();
     const origin = endpointPlace(request, "USER_LOCATION");
 
@@ -1056,14 +1152,29 @@ async function executeSearch(
         ? request.options.resultLimit * DURATION_SORT_COLLECTION_FACTOR
         : request.options.resultLimit;
     const railExpansionsByHub = new Map<string, number>();
+    const boundedSearch = BOUNDED_SEARCH_SORTS.has(request.options.sortBy);
+    // The resultLimit-th best score among the kept results; Infinity until
+    // that many are kept. Only used when boundedSearch.
+    let scoreToBeat = Number.POSITIVE_INFINITY;
+    let expandedStatesWhenFull: number | null = null;
 
     while (
         queue.length > 0
-        && matchingResultCount < collectionLimit
+        && (boundedSearch || matchingResultCount < collectionLimit)
     ) {
         const state = queue.pop();
         if (!state) break;
         if (state.arrivalMs > horizonEnd.getTime()) continue;
+        if (
+            boundedSearch
+            && completionLowerBoundMinutes(
+                state, request, request.options.sortBy, policy.transferPenaltyMinutes
+            ) >= scoreToBeat
+        ) continue;
+        if (
+            expandedStatesWhenFull !== null
+            && expandedStates - expandedStatesWhenFull >= BOUNDED_SEARCH_EXTRA_EXPANSIONS
+        ) break;
         if (expandedStates >= maximumExpandedStates) {
             truncated = true;
             break;
@@ -1084,7 +1195,11 @@ async function executeSearch(
                 || request.options.journeyTypes.some(filter =>
                     matchesJourneyType(result, filter)
                 );
-            if (matchesRequestedType) {
+            const canEnterTopResults = !boundedSearch
+                || boundedSortScoreMinutes(
+                    result, request.options.sortBy, policy.transferPenaltyMinutes
+                ) < scoreToBeat;
+            if (matchesRequestedType && canEnterTopResults) {
                 const serviceKeysArray = chainToArray(state.serviceKeys);
                 const key = JSON.stringify(serviceKeysArray);
                 const known = results.get(key);
@@ -1094,16 +1209,24 @@ async function executeSearch(
                         < known.result.totalJourneyMinutes
                 ) {
                     results.set(key, { serviceKeys: serviceKeysArray, result });
-                    const accessPruned = pruneDominatedAccessPaths(
-                        [...results.values()]
+                    const kept = pruneRedundantContinuations(
+                        pruneDominatedAccessPaths([...results.values()])
                     );
-                    matchingResultCount = Math.min(
-                        collectionLimit,
-                        pruneRedundantContinuations(accessPruned).length
-                    );
+                    matchingResultCount = Math.min(collectionLimit, kept.length);
+                    if (boundedSearch && kept.length >= collectionLimit) {
+                        const scores = kept
+                            .map(entry => boundedSortScoreMinutes(
+                                entry,
+                                request.options.sortBy,
+                                policy.transferPenaltyMinutes
+                            ))
+                            .sort((left, right) => left - right);
+                        scoreToBeat = scores[collectionLimit - 1];
+                        expandedStatesWhenFull ??= expandedStates;
+                    }
                 }
             }
-            if (matchingResultCount >= collectionLimit) break;
+            if (!boundedSearch && matchingResultCount >= collectionLimit) break;
         }
         if (state.scheduledLegs >= maximumScheduledLegs) continue;
 

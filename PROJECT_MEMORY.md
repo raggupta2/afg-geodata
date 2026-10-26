@@ -2117,3 +2117,53 @@ each change (not only at the end):
 - Airport hub names are also old Aviation Edge values (133 of 165 differ
   from the SQLite export). Migration `20261023130000_airport_hub_names` sets
   132 of them (VTZ kept); applied to the local DB only (2026-10-23).
+
+### Mixed / recommended multimodal search stopped too early (2026-10-24)
+
+- **Cause:** `executeSearch` stopped at the first `resultLimit` matching
+  results. Because of `HEURISTIC_WEIGHT` (12) the queue does not pop
+  completions in score order, so "Mixed" kept the cheap flight-then-train
+  trips it met first. Train-then-flight trips (they need a feeder train)
+  were rarely reached. Also, with trains allowed, origin airports far from
+  the destination (e.g. IXC for Dehradun → Chennai) were never expanded:
+  the weighted heuristic made them look a day away.
+- **Fix (`multimodal-journey.service.ts`):**
+  - `sortBy` recommended/arrival (`BOUNDED_SEARCH_SORTS`): keep searching
+    after `resultLimit` results and drop states whose
+    `completionLowerBoundMinutes` (last train/flight arrival + 900 km/h
+    straight line, + transfers × policy penalty + flight extras earned) is
+    not below the `resultLimit`-th best score. Stops at the state budget or
+    `BOUNDED_SEARCH_EXTRA_EXPANSIONS` (env
+    `MULTIMODAL_BOUNDED_EXTRA_EXPANSIONS`, default 2000) after the top list
+    first fills; not reported as `truncated`.
+  - `StateQueue`: origin seeds (`scheduledLegs` 0) always pop first;
+    recommended adds `(scheduledLegs − 1) × transfer penalty` to priority.
+  - transfers / departure / duration keep their old stop rule.
+- **Measured (10 long routes, 2026-11-16 06:00, local DB):** Mixed average
+  result 1–5 h earlier, train→flight trips now appear (Jhansi → Bengaluru
+  best: train to Faridabad + DEL→BLR, arrives 19:22 same day, was 05:16 next
+  day), 1.1–2.7 s (was 0.2–1.2 s). Flight only: same speed (~0.15 s),
+  better flights (Dehradun → Chennai IXC→MAA arrives 15:54, was 18:44).
+  No-filter: 1.4–2.7 s (was 1.2–2.1 s). Arrival/duration equal or better.
+  Two new tests cover Jhansi → Bengaluru and the IXC direct.
+
+### Railway stations with another station's coordinates (2026-10-24)
+
+- **Found:** consecutive stops of active trains whose straight-line distance
+  exceeds 1.15 × timetable km + 15 km. 16 stations were placed at a
+  similarly named station elsewhere (BBK Barabanki in West Bengal, city
+  "Dhanbad"; MD Madar near Udaipur; MUW at MPRD's exact point; KUU named
+  "Bhuntar Airport" on an Odisha line). Other checks were clean: no station
+  outside India, every station hub within 500 m of its station, every hub
+  within 60 km of its city.
+- **Fix:** migration `20261024160000_fix_station_coordinates` (written, NOT
+  applied). New points: MD/HKR from their correct duplicate rows (MDJN,
+  HKNT); others interpolated between the nearest correctly placed stops.
+  Re-maps the cities and rebuilds the transfer links. Backup:
+  `maintenance_backups.station_coordinates_20261024`.
+- **Names (user-confirmed 2026-10-24):** the same migration renames the
+  station and its hub: KTCR → Kottacheruvu, SVZ → Sarai Harkhu, KUU →
+  Kuhuri. The KUU airport hub ("Kullu Manali Airport") is untouched.
+- **Left open:** DAKA (Dhaka, Bangladesh) and
+  DJRZ not moved; ~10 single-train pairs look like timetable distance
+  errors, not coordinates.

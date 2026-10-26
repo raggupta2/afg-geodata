@@ -1075,6 +1075,15 @@ though measured to have no effect on this search's actual wall time - the
 candidate pool reaching them is small (~12-20 items); the real cost is
 entirely upstream in the provider search.
 
+### 34. Fix the Mixed train + flight gap and the place data (2026-10-24)
+
+After a read-only review of search speed and quality, the user asked to fix
+"the mixed train + flight gap" and to "keep fixing the place data", allowing
+tsc, tests, read-only DB queries and test searches; any data migration is
+written for review and applied only on the user's go-ahead. See
+PROJECT_MEMORY "Mixed / recommended multimodal search stopped too early" and
+"Railway stations with another station's coordinates".
+
 ## Current handoff state
 
 - The working tree now also includes, on top of everything described above:

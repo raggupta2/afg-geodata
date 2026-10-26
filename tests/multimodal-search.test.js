@@ -506,6 +506,92 @@ test("busy airports keep later flights: Delhi to Mangaluru finds the afternoon d
     }), "Expected the direct DEL -> IXE flight among the results.");
 });
 
+test("Mixed search finds the same-day train-then-flight trip: Jhansi to Bengaluru", async t => {
+    const flight = await prisma.aviationFlightInstance.findFirst({
+        where: {
+            active: true,
+            departureAt: {
+                gte: new Date("2026-11-16T12:00:00+05:30"),
+                lt: new Date("2026-11-16T18:00:00+05:30")
+            },
+            departureAirport: { iataCode: "DEL" },
+            arrivalAirport: { iataCode: "BLR" }
+        }
+    });
+    if (!flight) {
+        t.skip("No afternoon DEL -> BLR flight on 2026-11-16 in this database.");
+        return;
+    }
+    // The search used to stop at the first 20 matches it met. Flight-then-
+    // train trips are found first, so the best option was a Bhopal evening
+    // flight arriving the next morning, not a morning train to Delhi and an
+    // afternoon flight arriving the same day.
+    const response = await fetch(`${baseUrl}/api/v1/journeys/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            origin: { latitude: 25.4484, longitude: 78.5685 },
+            destination: { latitude: 12.9716, longitude: 77.5946 },
+            departureAt: "2026-11-16T06:00:00+05:30",
+            options: {
+                journeyTypes: ["RAIL_TO_FLIGHT", "FLIGHT_TO_RAIL"],
+                resultOffset: 0,
+                pageSize: 20
+            }
+        })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    const best = body.data.journeyResults[0];
+    const scheduledModes = best.legs
+        .filter(leg => leg.mode === "RAIL" || leg.mode === "FLIGHT")
+        .map(leg => leg.mode);
+    assert.deepEqual(scheduledModes, ["RAIL", "FLIGHT"]);
+    assert.ok(
+        best.finalArrivalAt.startsWith("2026-11-16"),
+        `Expected a same-day arrival; got ${best.finalArrivalAt}`
+    );
+});
+
+test("all-types search expands origin airports first: Dehradun to Chennai finds the IXC direct", async t => {
+    const direct = await prisma.aviationFlightInstance.findFirst({
+        where: {
+            active: true,
+            departureAt: {
+                gte: new Date("2026-11-16T09:00:00+05:30"),
+                lt: new Date("2026-11-17T00:00:00+05:30")
+            },
+            departureAirport: { iataCode: "IXC" },
+            arrivalAirport: { iataCode: "MAA" }
+        }
+    });
+    if (!direct) {
+        t.skip("No IXC -> MAA flight on 2026-11-16 in this database.");
+        return;
+    }
+    // With trains allowed, trains heading south used to keep the Chandigarh
+    // airport (about 2,000 km from Chennai) from ever being expanded.
+    const response = await fetch(`${baseUrl}/api/v1/journeys/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            origin: { latitude: 30.3165, longitude: 78.0322 },
+            destination: { latitude: 13.0827, longitude: 80.2707 },
+            departureAt: "2026-11-16T06:00:00+05:30",
+            options: { resultOffset: 0, pageSize: 20 }
+        })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.ok(body.data.journeyResults.some(journey => {
+        const scheduled = journey.legs.filter(leg =>
+            leg.mode === "RAIL" || leg.mode === "FLIGHT");
+        return scheduled.length === 1
+            && scheduled[0].from.code === "IXC"
+            && scheduled[0].to.code === "MAA";
+    }), "Expected the direct IXC -> MAA flight among the results.");
+});
+
 test("imported flight instances are domestic operating services", async t => {
     const count = await prisma.aviationFlightInstance.count();
     if (count === 0) {

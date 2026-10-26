@@ -22,7 +22,21 @@ not any agent's private memory — is the source of truth for "where are we".
 
 ---
 
-## Current status (updated 2026-10-23)
+## Current status (updated 2026-10-24)
+
+- **Update 2026-10-24 (Mixed search + station data):** multimodal search
+  for recommended/arrival sorts no longer stops at the first 20 matches,
+  and origin hubs are expanded first. Mixed now finds train→flight trips
+  and much earlier arrivals (1.1–2.7 s, was 0.2–1.2 s). Uncommitted; tsc
+  clean, railway 13/13, multimodal 30/0/1 (2 new tests); servers need
+  rebuild + restart. New migration
+  `20261024160000_fix_station_coordinates` (16 misplaced stations, e.g.
+  Barabanki; also renames KTCR/SVZ/KUU) is **applied to the local DB only**
+  (2026-10-24, via `prisma db execute` + `migrate resolve`); not on the server.
+  **Also found:** someone applied `20261024090000_deactivate_test_trains`
+  to the local DB at 14:29 IST (trains 80000/90000 "ABCD" inactive) and the
+  migration folder is now empty, so `prisma migrate status` fails (P3015).
+  Not touched. See the last log entry.
 
 - **Update 2026-10-23 (city coordinates):** migration
   `20261023140000_fix_city_coordinates` moves Bilaspur, Bareli, Kota and
@@ -1080,3 +1094,92 @@ and `CONVERSATION_MEMORY.md` for details.
   1 skip.
 - **Next:** commit when the user asks; production needs `prisma migrate
   deploy` (4 migrations) + rebuild + restart; restart the :3000 dev server.
+
+### 2026-10-24 — Read-only review: search speed and result quality (Claude Code, Opus 5.5)
+
+- **Request:** how to make route search faster and give better results.
+- **Done:** read-only review of the handoff docs, `railway-provider.service.ts`
+  (state budgets: `MAX_EXPANDED_STATES` 30k, concurrency 2 per worker),
+  result caches and `journey-results.js`. Recommendations given in chat:
+  benchmark set first; time-budget + best-so-far results; cancel server
+  work when the client disconnects (no `req` close handling found); return
+  one ranked pool and sort on the client; show direct options first;
+  longer term a round-based (RAPTOR-style) rail search.
+- **No code changed; no commands run** besides reading files.
+- **Next:** user picks which item to start.
+
+### 2026-10-24 — Mixed train + flight gap and misplaced stations (Claude Code, Opus 5.5)
+
+- **Request:** fix the mixed train + flight gap and keep fixing place data.
+  User allowed tsc, tests, read-only DB queries and test searches; data
+  migrations are applied only after review.
+- **Cause (search):** `executeSearch` stopped at the first 20 matches. The
+  weighted heuristic does not pop them in score order, so Mixed returned
+  cheap flight→train trips and missed better train→flight ones. With trains
+  allowed, far origin airports (IXC for Dehradun → Chennai) never expanded.
+- **Changed:** `src/services/multimodal-journey.service.ts` — branch and
+  bound for recommended/arrival (`BOUNDED_SEARCH_SORTS`,
+  `completionLowerBoundMinutes`, `BOUNDED_SEARCH_EXTRA_EXPANSIONS` = 2000,
+  env `MULTIMODAL_BOUNDED_EXTRA_EXPANSIONS`); `StateQueue` pops origin hubs
+  first and adds the transfer penalty for recommended.
+  `tests/multimodal-search.test.js` — two tests (Jhansi → Bengaluru
+  same-day train→flight; Dehradun → Chennai IXC direct).
+- **Measured** (10 routes, 16 Nov 06:00, old vs new build): Mixed average
+  result 1–5 h earlier, 1.1–2.7 s (was 0.2–1.2 s); Flight only better
+  flights at ~0.15 s; no filter 1.4–2.7 s (was 1.2–2.1 s); arrival and
+  duration sorts equal or better. `npx tsc --noEmit` clean;
+  railway-search 13/13; multimodal-search 30 pass / 0 fail / 1 skip.
+- **Place data (read-only checks):** 16 stations carry another station's
+  coordinates (BBK Barabanki in West Bengal / city Dhanbad, MD Madar near
+  Udaipur, CAA, LSR, PSD, MUW, SNQ, PDG, RNE, KMV, CTH, PNPI, HKR, KUU,
+  KTCR, SVZ). Added
+  `prisma/migrations/20261024160000_fix_station_coordinates/migration.sql`
+  (backup, move station + hub, re-map city, rebuild links). **Not applied.**
+  Preview: BBK → Lucknow city, CAA → Muzaffarpur, LSR/PSD/KMV → Aurangabad.
+- **Not touched:** empty `20261024090000_deactivate_test_trains` folder
+  (applied locally by someone else today; breaks `prisma migrate status`).
+- **Next:** user reviews the migration → restore or remove the empty
+  migration folder → apply locally → re-run the station check and a
+  Barabanki search; commit when asked; servers need rebuild + restart.
+- **Same day (names):** user reviewed the per-station table and gave the
+  real names. The migration now also renames railway_station + station hub
+  KTCR → Kottacheruvu, SVZ → Sarai Harkhu, KUU → Kuhuri (old names backed
+  up). The KUU airport hub ("Kullu Manali Airport") is not changed. Still
+  **not applied**; read-only preview confirmed the three rows and no
+  existing station with these names.
+- **Applied locally (same day, user-authorized):** `prisma db execute
+  --file …/20261024160000_fix_station_coordinates/migration.sql`, then
+  `prisma migrate resolve --applied` (the empty `deactivate_test_trains`
+  folder was left untouched). 16 rows backed up; all 16 stations and hubs
+  moved, the 3 renamed; active transfer links 6,706 → 6,707 (BBK → LKO,
+  KTCR → PUT, SVZ → VNS, CAA → MZU/DBR, LSR/PSD/KMV/CTH → IXU). Station
+  check: 113 → 14 flagged pairs (DAKA, DJRZ and single-train distance
+  errors). Barabanki searches (fresh process): BBK is the nearest station
+  (3.8 km); Barabanki → Gorakhpur boards at BBK; → New Delhi shows LKO
+  flights and 5 of 20 train results boarding at BBK. Running servers keep
+  cached station/graph data until restarted.
+- **Next:** commit when asked; production needs the five pending
+  migrations + rebuild + restart; decide what to do with the empty
+  `20261024090000_deactivate_test_trains` folder.
+- **Same day (names):** user reviewed the per-station table and gave the
+  real names. The migration now also renames railway_station + station hub
+  KTCR → Kottacheruvu, SVZ → Sarai Harkhu, KUU → Kuhuri (old names backed
+  up). The KUU airport hub ("Kullu Manali Airport") is not changed. Still
+  **not applied**; read-only preview confirmed the three rows and no
+  existing station with these names.
+
+### 2026-10-24 — Design only: collapse near-duplicate results (Claude Code, Opus 5.5)
+
+- **Request:** merge results that ride the same trains/flights and differ only
+  by a nearby boarding (or alighting) station, but still suggest the nearby
+  stations. "Do not change code."
+- **Measured (read-only searches, 16 Nov 06:00, recommended):** up to 14 of
+  20 slots are such variants (Indore → Jammu Train only: 19 results, 5
+  distinct trains; Haridwar → Kota All: 20 → 11; Mixed Indore → Jammu 20 →
+  10). Two kinds: boarding variants (HW vs RK on 22660) and alighting
+  variants (DLI vs DEE; KYN / LTT / TNA after the same flight).
+- **Found:** the train engine already computes `alternativeBoardingStations`
+  and `availableDestinationStations` but keeps one result per boarding
+  station on purpose (`itineraryKey`); `convertRailwayResult` drops both
+  lists, and the page never shows them.
+- **No code changed.** Design given in chat; next is the user's go-ahead.
